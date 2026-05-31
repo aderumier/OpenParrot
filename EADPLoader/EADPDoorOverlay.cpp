@@ -461,14 +461,14 @@ static DWORD PidFromExeName(const char* exeName)
 {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return 0;
-    PROCESSENTRY32 pe = {};
+    PROCESSENTRY32A pe = {};
     pe.dwSize = sizeof(pe);
     DWORD found = 0;
-    if (Process32First(snap, &pe))
+    if (Process32FirstA(snap, &pe))
     {
         do {
             if (_stricmp(pe.szExeFile, exeName) == 0) { found = pe.th32ProcessID; break; }
-        } while (Process32Next(snap, &pe));
+        } while (Process32NextA(snap, &pe));
     }
     CloseHandle(snap);
     return found;
