@@ -27,7 +27,7 @@ jobs:
 
       - name: Generate Visual Studio solution
         shell: cmd
-        run: premake5.exe vs2022
+        run: premake5.exe vs2019
 
       - name: Build
         shell: cmd
