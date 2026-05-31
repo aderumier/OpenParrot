@@ -75,3 +75,19 @@ include "OpenParrotLoader"
 include "OpenParrotKonamiLoader"
 include "iDmacDrv"
 include "OpenBanapass"
+
+-- Standalone door overlay for Elevator Action Death Parade (x86 only)
+project "EADPDoorOverlay"
+	targetname "EADPDoorOverlay"
+	language "C++"
+	kind "WindowedApp"
+
+	files   { "EADPLoader/EADPDoorOverlay.cpp" }
+	links   { "gdiplus", "shlwapi", "user32", "gdi32", "kernel32" }
+
+	filter "platforms:x86"
+		-- Only x86: the game is 32-bit; we read its stack via ReadProcessMemory
+		-- and hardware breakpoints require matching bitness.
+
+	filter "platforms:x64"
+		flags { "ExcludeFromBuild" }

@@ -1,0 +1,54 @@
+name: Build (Windows)
+
+on:
+  push:
+    branches: [ "elevatordp-door-standalone", "master" ]
+  pull_request:
+    branches: [ "elevatordp-door-standalone", "master" ]
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: windows-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [ Win32, x64 ]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Generate Visual Studio solution
+        shell: cmd
+        run: premake5.exe vs2019
+
+      - name: Build
+        shell: cmd
+        run: |
+          msbuild OpenParrot.sln ^
+            /p:Configuration=Release ^
+            /p:Platform=${{ matrix.platform }} ^
+            /m ^
+            /verbosity:minimal
+
+      - name: Upload EADPDoorOverlay (Win32 only – matches 32-bit game)
+        if: matrix.platform == 'Win32'
+        uses: actions/upload-artifact@v4
+        with:
+          name: EADPDoorOverlay-Win32
+          path: build/bin/release/EADPDoorOverlay.exe
+          if-no-files-found: warn
+
+      - name: Upload full build output
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenParrot-${{ matrix.platform }}
+          path: build/bin/release/output/
+          if-no-files-found: warn
