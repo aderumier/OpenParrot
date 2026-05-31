@@ -75,3 +75,39 @@ include "OpenParrotLoader"
 include "OpenParrotKonamiLoader"
 include "iDmacDrv"
 include "OpenBanapass"
+
+-- EADP door overlay (Wine-compatible, x86 only — game is 32-bit)
+project "EADPDoorHook"
+	targetname "EADPDoorHook"
+	language "C++"
+	kind "SharedLib"
+
+	filter "platforms:x86"
+		files
+		{
+			"EADPLoader/EADPDoorHook.cpp",
+			"deps/src/buffer.c",
+			"deps/src/hook.c",
+			"deps/src/trampoline.c",
+			"deps/src/hde/hde32.c",
+		}
+		includedirs { "EADPLoader", "deps/inc/", "deps/src/" }
+		links { }
+
+	filter "platforms:x64"
+		-- Hook DLL must be 32-bit (game is 32-bit); skip x64 build
+		files { }
+
+project "EADPDoorOverlay"
+	targetname "EADPDoorOverlay"
+	language "C++"
+	kind "WindowedApp"
+
+	files { "EADPLoader/EADPDoorOverlay.cpp" }
+	includedirs { "EADPLoader" }
+	links { "gdiplus", "shlwapi", "user32", "gdi32", "kernel32" }
+
+	filter "platforms:x86"
+		-- nothing extra
+	filter "platforms:x64"
+		-- nothing extra
