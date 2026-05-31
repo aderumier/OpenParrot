@@ -288,7 +288,28 @@ done:
 }
 
 // ---------------------------------------------------------------------------
-// DLL entry point
+// Init thread – all MinHook work happens here, never in DllMain
+// ---------------------------------------------------------------------------
+static DWORD WINAPI InitThread(LPVOID)
+{
+    // Brief delay so DllMain returns and the loader lock is released before
+    // we start patching memory.
+    Sleep(100);
+
+    MH_Initialize();
+
+    DWORD base = (DWORD)GetModuleHandleA(NULL);
+    MH_CreateHook((void*)(base + 0xC4B10), AttractionDoorHook, (void**)&g_AttrOri);
+    MH_CreateHook((void*)(base + 0xC4C40), VibrationDoorHook,  (void**)&g_VibOri);
+    MH_EnableHook(MH_ALL_HOOKS);
+
+    // D3D9 hook is set up after the game window is ready
+    HookD3D9(NULL);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// DLL entry point – only creates the init thread; nothing else is safe here
 // ---------------------------------------------------------------------------
 BOOL WINAPI DllMain(HINSTANCE hInstDLL, DWORD fdwReason, LPVOID)
 {
@@ -296,14 +317,7 @@ BOOL WINAPI DllMain(HINSTANCE hInstDLL, DWORD fdwReason, LPVOID)
     {
     case DLL_PROCESS_ATTACH:
         DisableThreadLibraryCalls(hInstDLL);
-        MH_Initialize();
-        {
-            DWORD base = (DWORD)GetModuleHandleA(NULL);
-            MH_CreateHook((void*)(base + 0xC4B10), AttractionDoorHook, (void**)&g_AttrOri);
-            MH_CreateHook((void*)(base + 0xC4C40), VibrationDoorHook,  (void**)&g_VibOri);
-        }
-        MH_EnableHook(MH_ALL_HOOKS);
-        CreateThread(NULL, 0, HookD3D9, NULL, 0, NULL);
+        CreateThread(NULL, 0, InitThread, NULL, 0, NULL);
         break;
 
     case DLL_PROCESS_DETACH:

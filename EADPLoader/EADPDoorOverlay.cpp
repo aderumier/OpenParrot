@@ -117,52 +117,27 @@ static bool InjectDLL(DWORD pid)
 
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR lpCmdLine, int)
 {
-    PROCESS_INFORMATION pi = {};
-
-    // Optionally launch the game
+    // The game MUST be started through OpenParrotLoader (or TeknoParrot) first
+    // so that OpenParrot's patches are applied before the game runs.
+    // Launching game.exe directly here would crash because those patches are missing.
+    //
+    // If a path was passed on the command line, warn the user and ignore it.
     if (lpCmdLine && lpCmdLine[0])
     {
-        wchar_t wide[MAX_PATH] = {};
-        MultiByteToWideChar(CP_ACP, 0, lpCmdLine, -1, wide, MAX_PATH);
-        wchar_t* p = wide;
-        if (*p == L'"') { ++p; wchar_t* q = wcsrchr(p, L'"'); if (q) *q = 0; }
-
-        // Resolve to a full absolute path (handles bare "game.exe" relative to CWD)
-        wchar_t absPath[MAX_PATH] = {};
-        GetFullPathNameW(p, MAX_PATH, absPath, NULL);
-
-        // If not found via CWD, try next to this exe
-        if (GetFileAttributesW(absPath) == INVALID_FILE_ATTRIBUTES)
-        {
-            wchar_t exeDir[MAX_PATH];
-            GetModuleFileNameW(NULL, exeDir, MAX_PATH);
-            PathRemoveFileSpecW(exeDir);
-            PathCombineW(absPath, exeDir, p);
-        }
-
-        // Working dir = folder containing the game exe (fall back to CWD if bare name)
-        wchar_t dir[MAX_PATH];
-        wcscpy_s(dir, absPath);
-        PathRemoveFileSpecW(dir);
-        if (dir[0] == L'\0')
-            GetCurrentDirectoryW(MAX_PATH, dir);
-
-        STARTUPINFOW si = {}; si.cb = sizeof(si);
-        if (!CreateProcessW(absPath, NULL, NULL, NULL, FALSE, 0, NULL, dir, &si, &pi))
-        {
-            wchar_t msg[512];
-            swprintf_s(msg, L"Failed to launch game.\n\nPath tried:\n%s\n\nError: 0x%08X",
-                absPath, GetLastError());
-            MessageBoxW(NULL, msg, L"EADP Door Overlay", MB_ICONERROR);
-            return 1;
-        }
+        MessageBoxW(NULL,
+            L"EADPDoorOverlay does not launch the game directly.\n\n"
+            L"Please start the game through OpenParrotLoader first:\n"
+            L"  OpenParrotLoader.exe OpenParrot game.exe\n\n"
+            L"Then run EADPDoorOverlay.exe (no arguments) to attach.",
+            L"EADP Door Overlay", MB_ICONINFORMATION);
+        return 0;
     }
 
     // Wait up to 120 s for the game window
     HWND hwndGame = NULL;
     for (int i = 0; i < 1200 && !hwndGame; ++i)
     {
-        hwndGame = FindGameWindow(pi.dwProcessId);
+        hwndGame = FindGameWindow(0);
         if (!hwndGame) Sleep(100);
     }
     if (!hwndGame)
@@ -199,6 +174,5 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR lpCmdLine, int)
     HANDLE hGameProc = OpenProcess(SYNCHRONIZE, FALSE, pid);
     if (hGameProc) { WaitForSingleObject(hGameProc, INFINITE); CloseHandle(hGameProc); }
 
-    if (pi.hProcess) { CloseHandle(pi.hProcess); CloseHandle(pi.hThread); }
     return 0;
 }
