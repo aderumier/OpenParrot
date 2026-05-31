@@ -309,12 +309,12 @@ int wmain(int argc, wchar_t* argv[])
 	bool useRemoteThread = ShouldUseRemoteThread();
 
 	if (underWine)
-		wprintf(L"Wine detected – using RemoteThread injection (GetThreadContext polling unreliable on Wine).\n");
+		wprintf(L"Wine detected – using RunTo + RemoteThread injection.\n");
 	else if (useRemoteThread)
-		wprintf(L"Using RemoteThread injection method (TP_REMOTETHREAD set).\n");
+		wprintf(L"Using RemoteThread injection (TP_REMOTETHREAD set).\n");
 
-	if (!useRemoteThread)
-		FilePEFile = getPEFileInformation(gamePathW);
+	// Always need the PE entry point – both paths use RunTo to land there.
+	FilePEFile = getPEFileInformation(gamePathW);
 
 	// With arguments
 	if (argc == 4)
@@ -365,19 +365,9 @@ int wmain(int argc, wchar_t* argv[])
 
 	DWORD_PTR baseAddress = 0;
 
-	if (useRemoteThread)
-	{
-		// The process was created suspended; ntdll hasn't run yet so
-		// LoadLibraryW (called from the remote thread) would crash.
-		// Resume briefly so ntdll can finish initialising all DLLs,
-		// then re-suspend the main thread before we inject so game code
-		// can't run before our hooks are in place.
-		ResumeThread(pi.hThread);
-		Sleep(1000);
-		SuspendThread(pi.hThread);
-		wprintf(L"Success!\n");
-	}
-	else
+	// Both paths (shellcode and RemoteThread) must reach the game entry point
+	// before injecting so that hooks are in place before any game code runs.
+	// useRemoteThread only controls HOW we inject, not WHEN.
 	{
 		mycontext.ContextFlags = 0x00010000 + 1 + 2 + 4 + 8 + 0x10;
 		GetThreadContext(pi.hThread, &mycontext);
@@ -405,6 +395,7 @@ int wmain(int argc, wchar_t* argv[])
 
 		Sleep(1000);
 
+		// RunTo now uses suspend-check-resume so it works on Wine too.
 		if (!RunTo(baseAddress + FilePEFile.image_nt_headers.OptionalHeader.AddressOfEntryPoint, 1, 0))
 		{
 			wprintf(L"Failed to run the process\n");
@@ -491,17 +482,9 @@ int wmain(int argc, wchar_t* argv[])
 	wprintf(L"\nHave fun :)\n");
 
 	Sleep(2000);
-	
-	if (useRemoteThread)
-	{
-		ResumeThread(pi.hThread);
-		WaitForSingleObject(pi.hProcess, INFINITE);
-	}
-	else
-	{
-		ResumeThread(pi.hThread);
-		while (GetThreadContext(pi.hThread, &mycontext)) Sleep(2000);
-	}
+
+	ResumeThread(pi.hThread);
+	WaitForSingleObject(pi.hProcess, INFINITE);
 	
 	DWORD lpExitCode = 1;
 	::GetExitCodeThread(pi.hThread, &lpExitCode);
