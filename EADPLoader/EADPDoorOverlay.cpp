@@ -22,6 +22,7 @@
 #include <gdiplus.h>
 #include <algorithm>
 #include <cmath>
+#include <string>
 #include "EADPShared.h"
 
 #pragma comment(lib, "gdiplus.lib")
