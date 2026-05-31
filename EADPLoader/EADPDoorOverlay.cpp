@@ -457,18 +457,18 @@ static HWND WindowFromPid(DWORD pid)
 }
 
 // Find the PID of a process by exe name (e.g. "game.exe")
-static DWORD PidFromExeName(const char* exeName)
+static DWORD PidFromExeName(const wchar_t* exeName)
 {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return 0;
-    PROCESSENTRY32A pe = {};
+    PROCESSENTRY32W pe = {};
     pe.dwSize = sizeof(pe);
     DWORD found = 0;
-    if (Process32FirstA(snap, &pe))
+    if (Process32FirstW(snap, &pe))
     {
         do {
-            if (_stricmp(pe.szExeFile, exeName) == 0) { found = pe.th32ProcessID; break; }
-        } while (Process32NextA(snap, &pe));
+            if (_wcsicmp(pe.szExeFile, exeName) == 0) { found = pe.th32ProcessID; break; }
+        } while (Process32NextW(snap, &pe));
     }
     CloseHandle(snap);
     return found;
@@ -487,7 +487,7 @@ static HWND FindGameWindow(DWORD launchedPid)
     // 3. Any visible window from the process we launched
     if (launchedPid) { hw = WindowFromPid(launchedPid); if (hw) return hw; }
     // 4. Scan for a process named "game.exe" and find its window
-    DWORD gamePid = PidFromExeName("game.exe");
+    DWORD gamePid = PidFromExeName(L"game.exe");
     if (gamePid) return WindowFromPid(gamePid);
     return NULL;
 }
@@ -587,7 +587,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     DWORD pid = 0;
     GetWindowThreadProcessId(hwndGame, &pid);
     // If window search didn't resolve a PID, fall back to exe-name scan
-    if (!pid) pid = PidFromExeName("game.exe");
+    if (!pid) pid = PidFromExeName(L"game.exe");
 
     // Open a process handle for liveness checks in the render loop
     HANDLE hGameProc = pid ? OpenProcess(SYNCHRONIZE, FALSE, pid) : NULL;
