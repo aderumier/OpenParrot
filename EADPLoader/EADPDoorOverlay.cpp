@@ -126,9 +126,36 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR lpCmdLine, int)
         MultiByteToWideChar(CP_ACP, 0, lpCmdLine, -1, wide, MAX_PATH);
         wchar_t* p = wide;
         if (*p == L'"') { ++p; wchar_t* q = wcsrchr(p, L'"'); if (q) *q = 0; }
-        wchar_t dir[MAX_PATH]; wcscpy_s(dir, p); PathRemoveFileSpecW(dir);
+
+        // Resolve to a full absolute path (handles bare "game.exe" relative to CWD)
+        wchar_t absPath[MAX_PATH] = {};
+        GetFullPathNameW(p, MAX_PATH, absPath, NULL);
+
+        // If not found via CWD, try next to this exe
+        if (GetFileAttributesW(absPath) == INVALID_FILE_ATTRIBUTES)
+        {
+            wchar_t exeDir[MAX_PATH];
+            GetModuleFileNameW(NULL, exeDir, MAX_PATH);
+            PathRemoveFileSpecW(exeDir);
+            PathCombineW(absPath, exeDir, p);
+        }
+
+        // Working dir = folder containing the game exe (fall back to CWD if bare name)
+        wchar_t dir[MAX_PATH];
+        wcscpy_s(dir, absPath);
+        PathRemoveFileSpecW(dir);
+        if (dir[0] == L'\0')
+            GetCurrentDirectoryW(MAX_PATH, dir);
+
         STARTUPINFOW si = {}; si.cb = sizeof(si);
-        CreateProcessW(p, NULL, NULL, NULL, FALSE, 0, NULL, dir, &si, &pi);
+        if (!CreateProcessW(absPath, NULL, NULL, NULL, FALSE, 0, NULL, dir, &si, &pi))
+        {
+            wchar_t msg[512];
+            swprintf_s(msg, L"Failed to launch game.\n\nPath tried:\n%s\n\nError: 0x%08X",
+                absPath, GetLastError());
+            MessageBoxW(NULL, msg, L"EADP Door Overlay", MB_ICONERROR);
+            return 1;
+        }
     }
 
     // Wait up to 120 s for the game window
@@ -140,11 +167,18 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR lpCmdLine, int)
     }
     if (!hwndGame)
     {
-        MessageBoxW(NULL,
-            L"Game window not found.\n\n"
-            L"Searched for class \"Eva\" (with and without OpenParrot title)\n"
-            L"and for a running process named game.exe.",
-            L"EADP Door Overlay", MB_ICONERROR);
+        wchar_t msg[512];
+        swprintf_s(msg,
+            L"Game window not found after 120 s.\n\n"
+            L"Strategies tried:\n"
+            L"  1. FindWindow class=\"Eva\" title=\"%hs\"\n"
+            L"  2. FindWindow class=\"Eva\" (any title)\n"
+            L"  3. Window of launched PID %lu\n"
+            L"  4. Process named game.exe\n\n"
+            L"If the game uses a different window class or exe name,\n"
+            L"start the game first, then run EADPDoorOverlay.exe with no arguments.",
+            GAME_TITLE, pi.dwProcessId);
+        MessageBoxW(NULL, msg, L"EADP Door Overlay", MB_ICONERROR);
         return 1;
     }
 
