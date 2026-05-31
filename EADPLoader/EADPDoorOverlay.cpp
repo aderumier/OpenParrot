@@ -25,6 +25,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <tlhelp32.h>
 #include <shlwapi.h>
 #include <gdiplus.h>
 #include <algorithm>
@@ -435,6 +436,63 @@ static HWND CreateOverlay()
 }
 
 // ---------------------------------------------------------------------------
+// Game window search
+// ---------------------------------------------------------------------------
+
+// Find any visible window that belongs to a given PID.
+struct FindByPid { DWORD pid; HWND hwnd; };
+static BOOL CALLBACK FindByPidProc(HWND hw, LPARAM lp)
+{
+    auto* d = (FindByPid*)lp;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hw, &pid);
+    if (pid == d->pid && IsWindowVisible(hw)) { d->hwnd = hw; return FALSE; }
+    return TRUE;
+}
+static HWND WindowFromPid(DWORD pid)
+{
+    FindByPid d = { pid, NULL };
+    EnumWindows(FindByPidProc, (LPARAM)&d);
+    return d.hwnd;
+}
+
+// Find the PID of a process by exe name (e.g. "game.exe")
+static DWORD PidFromExeName(const char* exeName)
+{
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    PROCESSENTRY32 pe = {};
+    pe.dwSize = sizeof(pe);
+    DWORD found = 0;
+    if (Process32First(snap, &pe))
+    {
+        do {
+            if (_stricmp(pe.szExeFile, exeName) == 0) { found = pe.th32ProcessID; break; }
+        } while (Process32Next(snap, &pe));
+    }
+    CloseHandle(snap);
+    return found;
+}
+
+// Try strategies in order so we find the window regardless of whether
+// OpenParrot has renamed the title or not.
+static HWND FindGameWindow(DWORD launchedPid)
+{
+    // 1. Exact match (OpenParrot-renamed window)
+    HWND hw = FindWindowA(GAME_CLASS, GAME_TITLE);
+    if (hw) return hw;
+    // 2. Class-only match (game's own window class, any title)
+    hw = FindWindowA(GAME_CLASS, NULL);
+    if (hw) return hw;
+    // 3. Any visible window from the process we launched
+    if (launchedPid) { hw = WindowFromPid(launchedPid); if (hw) return hw; }
+    // 4. Scan for a process named "game.exe" and find its window
+    DWORD gamePid = PidFromExeName("game.exe");
+    if (gamePid) return WindowFromPid(gamePid);
+    return NULL;
+}
+
+// ---------------------------------------------------------------------------
 // Image loader
 // ---------------------------------------------------------------------------
 
@@ -505,22 +563,34 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
         CreateProcessW(p, NULL, NULL, NULL, FALSE, 0, NULL, dir, &si, &g_pi);
     }
 
-    // Wait for the game window
+    // Wait for the game window (up to 120 s; tries class+title, class-only, PID)
     HWND hwndGame = NULL;
-    for (int i = 0; i < 600 && !hwndGame; ++i)
+    for (int i = 0; i < 1200 && !hwndGame; ++i)
     {
-        hwndGame = FindWindowA(GAME_CLASS, GAME_TITLE);
+        hwndGame = FindGameWindow(g_pi.dwProcessId);
         if (!hwndGame) Sleep(100);
     }
     if (!hwndGame)
     {
-        MessageBoxW(NULL, L"Game window not found.", L"EADP Door Overlay", MB_ICONERROR);
+        MessageBoxW(NULL,
+            L"Game window not found.\n\n"
+            L"Searched for:\n"
+            L"  class \"Eva\" with title \"" TEXT(GAME_TITLE) L"\"\n"
+            L"  class \"Eva\" with any title\n"
+            L"  any visible window of the launched process\n\n"
+            L"Make sure the game is running.",
+            L"EADP Door Overlay", MB_ICONERROR);
         Gdiplus::GdiplusShutdown(gdipToken);
         return 1;
     }
 
     DWORD pid = 0;
     GetWindowThreadProcessId(hwndGame, &pid);
+    // If window search didn't resolve a PID, fall back to exe-name scan
+    if (!pid) pid = PidFromExeName("game.exe");
+
+    // Open a process handle for liveness checks in the render loop
+    HANDLE hGameProc = pid ? OpenProcess(SYNCHRONIZE, FALSE, pid) : NULL;
 
     // Start debug loop thread – this attaches to the game and arms the breakpoints
     HANDLE hDbgThread = CreateThread(NULL, 0, DebugLoop, (LPVOID)(ULONG_PTR)pid, 0, NULL);
@@ -561,14 +631,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
             DispatchMessageW(&msg);
         }
 
-        if (!FindWindowA(GAME_CLASS, GAME_TITLE)) break;
+        // Stop when the game process exits (independent of window title)
+        if (hGameProc && WaitForSingleObject(hGameProc, 0) != WAIT_TIMEOUT) break;
 
         DWORD now = GetTickCount();
         if (now - last < 16) { Sleep(1); continue; }
         last = now;
 
         RECT r;
-        HWND hwndNow = FindWindowA(GAME_CLASS, GAME_TITLE);
+        HWND hwndNow = FindGameWindow(pid);
         if (!hwndNow) break;
         if (!GetWindowRect(hwndNow, &r)) continue;
 
@@ -585,6 +656,7 @@ cleanup:
     DebugActiveProcessStop(pid);
     WaitForSingleObject(hDbgThread, 3000);
     CloseHandle(hDbgThread);
+    if (hGameProc) CloseHandle(hGameProc);
 
     delete pLeft;
     delete pRight;
