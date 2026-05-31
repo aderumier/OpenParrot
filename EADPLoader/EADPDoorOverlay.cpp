@@ -442,14 +442,52 @@ static bool LaunchGame(const wchar_t* exePath)
         0, NULL, dir, &si, &g_pi) != FALSE;
 }
 
-static DWORD FindGamePID()
+// --- Flexible game-window search (4 strategies) ----------------------------
+
+struct FindByPid { DWORD pid; HWND hwnd; };
+static BOOL CALLBACK FindByPidProc(HWND hw, LPARAM lp)
 {
-    HWND hwnd = FindWindowA(EADP_GAME_CLASS, EADP_GAME_TITLE);
-    if (!hwnd)
-        return 0;
+    auto* d = (FindByPid*)lp;
     DWORD pid = 0;
-    GetWindowThreadProcessId(hwnd, &pid);
-    return pid;
+    GetWindowThreadProcessId(hw, &pid);
+    if (pid == d->pid && IsWindowVisible(hw)) { d->hwnd = hw; return FALSE; }
+    return TRUE;
+}
+static HWND WindowFromPid(DWORD pid)
+{
+    FindByPid d = { pid, NULL };
+    EnumWindows(FindByPidProc, (LPARAM)&d);
+    return d.hwnd;
+}
+
+static DWORD PidFromExeName(const wchar_t* exeName)
+{
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    PROCESSENTRY32W pe = {};
+    pe.dwSize = sizeof(pe);
+    DWORD found = 0;
+    if (Process32FirstW(snap, &pe))
+        do { if (_wcsicmp(pe.szExeFile, exeName) == 0) { found = pe.th32ProcessID; break; } }
+        while (Process32NextW(snap, &pe));
+    CloseHandle(snap);
+    return found;
+}
+
+static HWND FindGameWindow(DWORD launchedPid)
+{
+    // 1. Exact match: class + OpenParrot-patched title
+    HWND hw = FindWindowA(EADP_GAME_CLASS, EADP_GAME_TITLE);
+    if (hw) return hw;
+    // 2. Class-only: game running without OpenParrot renaming the window
+    hw = FindWindowA(EADP_GAME_CLASS, NULL);
+    if (hw) return hw;
+    // 3. Any visible window of the process we launched
+    if (launchedPid) { hw = WindowFromPid(launchedPid); if (hw) return hw; }
+    // 4. Scan for game.exe and find its window
+    DWORD gamePid = PidFromExeName(L"game.exe");
+    if (gamePid) return WindowFromPid(gamePid);
+    return NULL;
 }
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
@@ -497,18 +535,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
         LaunchGame(p);
     }
 
-    // Wait for the game window to appear
+    // Wait for the game window (up to 120 s; tries 4 strategies)
     HWND hwndGame = NULL;
-    for (int i = 0; i < 600; ++i)
+    for (int i = 0; i < 1200 && !hwndGame; ++i)
     {
-        hwndGame = FindWindowA(EADP_GAME_CLASS, EADP_GAME_TITLE);
-        if (hwndGame)
-            break;
-        Sleep(100);
+        hwndGame = FindGameWindow(g_pi.dwProcessId);
+        if (!hwndGame) Sleep(100);
     }
     if (!hwndGame)
     {
-        MessageBoxW(NULL, L"Game window not found.", L"EADP Door Overlay", MB_ICONERROR);
+        MessageBoxW(NULL,
+            L"Game window not found.\n\n"
+            L"Searched for class \"Eva\" (with and without OpenParrot title)\n"
+            L"and for a running process named game.exe.\n\n"
+            L"Make sure the game is running.",
+            L"EADP Door Overlay", MB_ICONERROR);
         Gdiplus::GdiplusShutdown(gdipToken);
         return 1;
     }
@@ -516,6 +557,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     // Inject the hook DLL
     DWORD pid = 0;
     GetWindowThreadProcessId(hwndGame, &pid);
+    if (!pid) pid = PidFromExeName(L"game.exe");
+
+    // Keep a process handle for the liveness check in the render loop
+    HANDLE hGameProc = pid ? OpenProcess(SYNCHRONIZE, FALSE, pid) : NULL;
 
     if (!InjectDLL(pid))
     {
@@ -555,9 +600,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
             DispatchMessageW(&msg);
         }
 
-        // Stop when game window is gone
-        HWND hwndNow = FindWindowA(EADP_GAME_CLASS, EADP_GAME_TITLE);
-        if (!hwndNow)
+        // Stop when the game process exits
+        if (hGameProc && WaitForSingleObject(hGameProc, 0) != WAIT_TIMEOUT)
             break;
 
         DWORD now = GetTickCount();
@@ -568,9 +612,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
         }
         lastTick = now;
 
-        // Get current game window bounds
+        // Re-find the window each frame (title may change, window may be recreated)
         RECT r;
-        if (!GetWindowRect(hwndNow, &r))
+        HWND hwndNow = FindGameWindow(pid);
+        if (!hwndNow || !GetWindowRect(hwndNow, &r))
             continue;
 
         int winX = r.left;
@@ -583,7 +628,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     }
 
 cleanup:
-    // Clean up
+    if (hGameProc) CloseHandle(hGameProc);
     if (g_pState)   { UnmapViewOfFile(g_pState);    g_pState    = NULL; }
     if (g_hSharedMem) { CloseHandle(g_hSharedMem);  g_hSharedMem = NULL; }
 
