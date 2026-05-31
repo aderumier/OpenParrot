@@ -76,7 +76,7 @@ include "OpenParrotKonamiLoader"
 include "iDmacDrv"
 include "OpenBanapass"
 
--- EADP door overlay (Wine-compatible, x86 only — game is 32-bit)
+-- EADP door overlay – DLL renders via D3D9 EndScene hook, x86 only
 project "EADPDoorHook"
 	targetname "EADPDoorHook"
 	language "C++"
@@ -92,22 +92,21 @@ project "EADPDoorHook"
 			"deps/src/hde/hde32.c",
 		}
 		includedirs { "EADPLoader", "deps/inc/", "deps/src/" }
-		links { }
+		libdirs     { "deps/inc/DirectXSDK/Lib/x86" }
+		links       { "d3d9", "d3dx9", "shlwapi" }
 
 	filter "platforms:x64"
-		-- Hook DLL must be 32-bit (game is 32-bit); skip x64 build
-		files { }
+		files { }   -- game is 32-bit; skip x64
 
 project "EADPDoorOverlay"
 	targetname "EADPDoorOverlay"
 	language "C++"
 	kind "WindowedApp"
 
+	-- Pure injector: no GDI, no D3D9 – all rendering is in EADPDoorHook.dll
 	files { "EADPLoader/EADPDoorOverlay.cpp" }
-	includedirs { "EADPLoader" }
-	links { "gdiplus", "shlwapi", "user32", "gdi32", "kernel32" }
+	links { "shlwapi", "user32", "kernel32" }
 
 	filter "platforms:x86"
-		-- nothing extra
 	filter "platforms:x64"
-		-- nothing extra
+		flags { "ExcludeFromBuild" }  -- inject into 32-bit game; x86 exe only
