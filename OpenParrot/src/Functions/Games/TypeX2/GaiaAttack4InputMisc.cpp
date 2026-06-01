@@ -3,6 +3,7 @@
 #include "Utility/InitFunction.h"
 #include "Functions/Global.h"
 #include "Utility/Helper.h"
+#include "Functions/TcpInputServer.h"
 
 extern int* ffbOffset;
 extern int* ffbOffset2;
@@ -70,6 +71,7 @@ void GaiaAttack4Inputs(Helpers* helpers)
 	{
 		Init = true;
 		imageBase = (DWORD)GetModuleHandleA(0);
+		TcpInputServer_Start(33610);
 	}
 
 	if (!D3D9hWnd)

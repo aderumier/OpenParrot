@@ -14,6 +14,10 @@ extern int* ffbOffset2;  // P1 X axis (0-255)
 extern int* ffbOffset3;  // P1 Y axis (0-255)
 extern int* ffbOffset4;  // P2 X axis (0-255)
 extern int* ffbOffset5;  // P2 Y axis (0-255)
+extern int* ffbOffset6;  // P3 X axis (0-255)
+extern int* ffbOffset7;  // P3 Y axis (0-255)
+extern int* ffbOffset8;  // P4 X axis (0-255)
+extern int* ffbOffset9;  // P4 Y axis (0-255)
 
 static HANDLE s_thread = NULL;
 static volatile bool s_running = false;
@@ -32,38 +36,46 @@ static void ParsePacket(const BYTE* buf)
     for (int i = 0; i < 4; i++) reload[i]  = buf[off++] != 0;
     for (int i = 0; i < 4; i++) action[i]  = buf[off++] != 0;
 
-    int buttons = *ffbOffset & ~0x0F; // preserve bits above P1/P2
+    // Preserve only volume bits (0x10/0x20); rebuild trigger/action bits from TCP.
+    int buttons = *ffbOffset & 0x30;
 
-    // Player 1 (gun 0)
-    if (reload[0])
-    {
-        // Offscreen reload: move aim outside play area and press trigger
-        *ffbOffset2 = 0;
-        *ffbOffset3 = 0;
-        buttons |= 0x01;
-    }
+    // Player 1 (gun 0)  trigger bit 0x01, action bit 0x02
+    if (reload[0]) { *ffbOffset2 = 0; *ffbOffset3 = 0; buttons |= 0x01; }
     else
     {
         *ffbOffset2 = (int)(axisX[0] * 255.0f);
         *ffbOffset3 = (int)(axisY[0] * 255.0f);
         if (trigger[0]) buttons |= 0x01;
     }
-    if (action[0]) buttons |= 0x02; // P1 grenade/action
+    if (action[0]) buttons |= 0x02;
 
-    // Player 2 (gun 1)
-    if (reload[1])
-    {
-        *ffbOffset4 = 0;
-        *ffbOffset5 = 0;
-        buttons |= 0x04;
-    }
+    // Player 2 (gun 1)  trigger bit 0x04, action bit 0x08
+    if (reload[1]) { *ffbOffset4 = 0; *ffbOffset5 = 0; buttons |= 0x04; }
     else
     {
         *ffbOffset4 = (int)(axisX[1] * 255.0f);
         *ffbOffset5 = (int)(axisY[1] * 255.0f);
         if (trigger[1]) buttons |= 0x04;
     }
-    if (action[1]) buttons |= 0x08; // P2 grenade/action
+    if (action[1]) buttons |= 0x08;
+
+    // Player 3 (gun 2)  trigger bit 0x40
+    if (reload[2]) { *ffbOffset6 = 0; *ffbOffset7 = 0; buttons |= 0x40; }
+    else
+    {
+        *ffbOffset6 = (int)(axisX[2] * 255.0f);
+        *ffbOffset7 = (int)(axisY[2] * 255.0f);
+        if (trigger[2]) buttons |= 0x40;
+    }
+
+    // Player 4 (gun 3)  trigger bit 0x80
+    if (reload[3]) { *ffbOffset8 = 0; *ffbOffset9 = 0; buttons |= 0x80; }
+    else
+    {
+        *ffbOffset8 = (int)(axisX[3] * 255.0f);
+        *ffbOffset9 = (int)(axisY[3] * 255.0f);
+        if (trigger[3]) buttons |= 0x80;
+    }
 
     *ffbOffset = buttons;
 }
