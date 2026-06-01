@@ -2,9 +2,9 @@ name: Build (Windows)
 
 on:
   push:
-    branches: [ "test", "test2", "master" ]
+    branches: [ "test", "test2", "tcpinput", "master" ]
   pull_request:
-    branches: [ "test", "test2", "master" ]
+    branches: [ "test", "test2", "tcpinput", "master" ]
 
 jobs:
   build:
