@@ -100,16 +100,17 @@ DWORD LinkRC5Data(const char* file, void* buf, int gameId)
 
 HCRYPTPROV GenerateKey()
 {
-	HCRYPTPROV result; // eax@2
-	HCRYPTPROV phProv; // [sp+4h] [bp-4h]@1
-
-	phProv = 0;
-	if (CryptAcquireContextA(&phProv, "TypeXAppCrypt", "Microsoft Base Cryptographic Provider v1.0", 1u, 0)
-		|| (result = CryptAcquireContextA(&phProv, "TypeXAppCrypt", "Microsoft Base Cryptographic Provider v1.0", 1u, CRYPT_NEWKEYSET)) != 0)
+	HCRYPTPROV phProv = 0;
+	// CRYPT_VERIFYCONTEXT avoids creating a persistent key container, which can
+	// fail under Wine. The private key is imported ephemerally and still works
+	// for all RSA operations needed by the pipe server.
+	if (!CryptAcquireContextA(&phProv, NULL, "Microsoft Base Cryptographic Provider v1.0", PROV_RSA_FULL, CRYPT_VERIFYCONTEXT))
 	{
-		result = phProv;
+		// Fallback: try with a persistent container
+		if (!CryptAcquireContextA(&phProv, "TypeXAppCrypt", "Microsoft Base Cryptographic Provider v1.0", PROV_RSA_FULL, 0))
+			CryptAcquireContextA(&phProv, "TypeXAppCrypt", "Microsoft Base Cryptographic Provider v1.0", PROV_RSA_FULL, CRYPT_NEWKEYSET);
 	}
-	return result;
+	return phProv;
 }
 
 bool __cdecl ReadFromPipe_410390(HANDLE hPipe, BYTE** a2, DWORD* a3, bool* pMode)
@@ -311,14 +312,14 @@ HANDLE PipeStuff_410550(int gameId)
 unsigned long __stdcall TXAppCryptThread(LPVOID sId)
 {
 	int id = *static_cast<int*>(sId);
+	delete static_cast<int*>(sId);
 	PipeStuff_410550(id);
-	delete sId;
 	return 1;
 }
 
 void init_CryptoPipe(NesicaKey id)
 {
-	static NesicaKey gameId = id;
-	CreateThread(nullptr, 0, TXAppCryptThread, &gameId, 0, nullptr);
+	int* gameId = new int(static_cast<int>(id));
+	CreateThread(nullptr, 0, TXAppCryptThread, gameId, 0, nullptr);
 }
 #endif
