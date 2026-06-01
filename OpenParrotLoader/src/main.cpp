@@ -29,8 +29,22 @@ char* LoaderExe = "OpenParrotLoader.exe";
 char* LoaderExe = "OpenParrotLoader64.exe";
 #endif
 
+// wine_get_version is exported by ntdll only under Wine.
+static bool IsRunningUnderWine()
+{
+	HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+	return hNtdll && (GetProcAddress(hNtdll, "wine_get_version") != NULL);
+}
+
 static bool ShouldUseRemoteThread()
 {
+	// Under Wine, GetThreadContext on a running thread returns stale data
+	// (Wine reads the saved kernel context, not live CPU registers), so the
+	// EIP-polling loop in RunTo never fires.  Force the RemoteThread path
+	// which avoids that loop entirely.
+	if (IsRunningUnderWine())
+		return true;
+
 	wchar_t envVar[256] = { 0 };
 	DWORD result = GetEnvironmentVariable(L"TP_REMOTETHREAD", envVar, std::size(envVar));
 	return (result > 0);
@@ -192,18 +206,29 @@ int RunTo(DWORD_PTR Address, DWORD Mode, DWORD_PTR Eip)
 	ReadProcessMemory(pi.hProcess, (LPVOID)Address, tempbuf, 4, 0);
 	WriteProcessMemory(pi.hProcess, (LPVOID)Address, "\xEB\xFE", 2, 0);
 	ResumeThread(pi.hThread);
-	while (GetThreadContext(pi.hThread, &mycontext))
+
+	// Suspend-check-resume loop: GetThreadContext is only accurate on a
+	// suspended thread.  The original approach polled it while the thread
+	// was running, which returns stale data under Wine and never converges.
+	while (true)
 	{
-		if (Mode == 1) WriteProcessMemory(pi.hProcess, (LPVOID)Address, "\xEB\xFE", 2, 0);
+		Sleep(10);
+		SuspendThread(pi.hThread);
+
+		if (Mode == 1)
+			WriteProcessMemory(pi.hProcess, (LPVOID)Address, "\xEB\xFE", 2, 0);
+
+		mycontext.ContextFlags = 0x00010000 + 1 + 2 + 4 + 8 + 0x10;
+		if (!GetThreadContext(pi.hThread, &mycontext)) return 0;
+
 #ifdef _M_IX86
 		if (mycontext.Eip == Address) break;
 #elif defined(_M_AMD64)
 		if (mycontext.Rip == Address) break;
 #endif
-		Sleep(100);
+		ResumeThread(pi.hThread);
 	}
-	SuspendThread(pi.hThread);
-	if (!GetThreadContext(pi.hThread, &mycontext)) return 0;
+	// Thread is now suspended at Address.
 	WriteProcessMemory(pi.hProcess, (LPVOID)Address, tempbuf, 4, 0);
 	return 1;
 }
@@ -280,14 +305,16 @@ int wmain(int argc, wchar_t* argv[])
 
 	wprintf(L"\nLoading game...\n");
 
+	bool underWine = IsRunningUnderWine();
 	bool useRemoteThread = ShouldUseRemoteThread();
-	if (useRemoteThread)
-	{
-		wprintf(L"Using RemoteThread injection method...\n");
-	}
-	else {
+
+	if (underWine)
+		wprintf(L"Wine detected – using RemoteThread injection (GetThreadContext polling unreliable on Wine).\n");
+	else if (useRemoteThread)
+		wprintf(L"Using RemoteThread injection method (TP_REMOTETHREAD set).\n");
+
+	if (!useRemoteThread)
 		FilePEFile = getPEFileInformation(gamePathW);
-	}
 
 	// With arguments
 	if (argc == 4)
@@ -340,8 +367,14 @@ int wmain(int argc, wchar_t* argv[])
 
 	if (useRemoteThread)
 	{
-		// For RemoteThread method, process is created suspended, just wait briefly
+		// The process was created suspended; ntdll hasn't run yet so
+		// LoadLibraryW (called from the remote thread) would crash.
+		// Resume briefly so ntdll can finish initialising all DLLs,
+		// then re-suspend the main thread before we inject so game code
+		// can't run before our hooks are in place.
+		ResumeThread(pi.hThread);
 		Sleep(1000);
+		SuspendThread(pi.hThread);
 		wprintf(L"Success!\n");
 	}
 	else
