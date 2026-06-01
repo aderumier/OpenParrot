@@ -34,6 +34,17 @@ static HANDLE s_applyThread = NULL;
 static volatile bool s_running = false;
 static int s_port = 0;
 
+static void ApplyState()
+{
+    if (!s_hasData) return;
+    // Preserve volume bits (0x10/0x20); overwrite trigger/action bits.
+    *ffbOffset  = (*ffbOffset & 0x30) | s_state.buttons;
+    *ffbOffset2 = s_state.x[0]; *ffbOffset3 = s_state.y[0];
+    *ffbOffset4 = s_state.x[1]; *ffbOffset5 = s_state.y[1];
+    *ffbOffset6 = s_state.x[2]; *ffbOffset7 = s_state.y[2];
+    *ffbOffset8 = s_state.x[3]; *ffbOffset9 = s_state.y[3];
+}
+
 // Dedicated apply thread: reapplies the last TCP state at ~0.1ms intervals
 // using QueryPerformanceCounter so Windows timer resolution doesn't limit us.
 static DWORD WINAPI ApplyThread(LPVOID)
@@ -56,17 +67,6 @@ static DWORD WINAPI ApplyThread(LPVOID)
         SwitchToThread();
     }
     return 0;
-}
-
-static void ApplyState()
-{
-    if (!s_hasData) return;
-    // Preserve volume bits (0x10/0x20); overwrite trigger/action bits.
-    *ffbOffset  = (*ffbOffset & 0x30) | s_state.buttons;
-    *ffbOffset2 = s_state.x[0]; *ffbOffset3 = s_state.y[0];
-    *ffbOffset4 = s_state.x[1]; *ffbOffset5 = s_state.y[1];
-    *ffbOffset6 = s_state.x[2]; *ffbOffset7 = s_state.y[2];
-    *ffbOffset8 = s_state.x[3]; *ffbOffset9 = s_state.y[3];
 }
 
 static void ParsePacket(const BYTE* buf)
