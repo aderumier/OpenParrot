@@ -502,9 +502,17 @@ int wmain(int argc, wchar_t* argv[])
 
 	Sleep(2000);
 
-	ResumeThread(pi.hThread);
-	WaitForSingleObject(pi.hProcess, INFINITE);
-	
+	if (useRemoteThread)
+	{
+		ResumeThread(pi.hThread);
+		WaitForSingleObject(pi.hProcess, INFINITE);
+	}
+	else
+	{
+		ResumeThread(pi.hThread);
+		while (GetThreadContext(pi.hThread, &mycontext)) Sleep(2000);
+	}
+
 	DWORD lpExitCode = 1;
 	::GetExitCodeThread(pi.hThread, &lpExitCode);
 
