@@ -207,28 +207,44 @@ int RunTo(DWORD_PTR Address, DWORD Mode, DWORD_PTR Eip)
 	WriteProcessMemory(pi.hProcess, (LPVOID)Address, "\xEB\xFE", 2, 0);
 	ResumeThread(pi.hThread);
 
-	// Suspend-check-resume loop: GetThreadContext is only accurate on a
-	// suspended thread.  The original approach polled it while the thread
-	// was running, which returns stale data under Wine and never converges.
-	while (true)
+	if (IsRunningUnderWine())
 	{
-		Sleep(10);
-		SuspendThread(pi.hThread);
+		// Under Wine, GetThreadContext on a running thread returns stale data
+		// (saved kernel context, not live registers).  Suspend before each read.
+		while (true)
+		{
+			Sleep(10);
+			SuspendThread(pi.hThread);
 
-		if (Mode == 1)
-			WriteProcessMemory(pi.hProcess, (LPVOID)Address, "\xEB\xFE", 2, 0);
+			if (Mode == 1)
+				WriteProcessMemory(pi.hProcess, (LPVOID)Address, "\xEB\xFE", 2, 0);
 
-		mycontext.ContextFlags = 0x00010000 + 1 + 2 + 4 + 8 + 0x10;
-		if (!GetThreadContext(pi.hThread, &mycontext)) return 0;
+			mycontext.ContextFlags = 0x00010000 + 1 + 2 + 4 + 8 + 0x10;
+			if (!GetThreadContext(pi.hThread, &mycontext)) return 0;
 
 #ifdef _M_IX86
-		if (mycontext.Eip == Address) break;
+			if (mycontext.Eip == Address) break;
 #elif defined(_M_AMD64)
-		if (mycontext.Rip == Address) break;
+			if (mycontext.Rip == Address) break;
 #endif
-		ResumeThread(pi.hThread);
+			ResumeThread(pi.hThread);
+		}
 	}
-	// Thread is now suspended at Address.
+	else
+	{
+		while (GetThreadContext(pi.hThread, &mycontext))
+		{
+			if (Mode == 1) WriteProcessMemory(pi.hProcess, (LPVOID)Address, "\xEB\xFE", 2, 0);
+#ifdef _M_IX86
+			if (mycontext.Eip == Address) break;
+#elif defined(_M_AMD64)
+			if (mycontext.Rip == Address) break;
+#endif
+			Sleep(100);
+		}
+		SuspendThread(pi.hThread);
+		if (!GetThreadContext(pi.hThread, &mycontext)) return 0;
+	}
 	WriteProcessMemory(pi.hProcess, (LPVOID)Address, tempbuf, 4, 0);
 	return 1;
 }
@@ -313,8 +329,8 @@ int wmain(int argc, wchar_t* argv[])
 	else if (useRemoteThread)
 		wprintf(L"Using RemoteThread injection (TP_REMOTETHREAD set).\n");
 
-	// Always need the PE entry point – both paths use RunTo to land there.
-	FilePEFile = getPEFileInformation(gamePathW);
+	if (underWine || !useRemoteThread)
+		FilePEFile = getPEFileInformation(gamePathW);
 
 	// With arguments
 	if (argc == 4)
@@ -365,9 +381,7 @@ int wmain(int argc, wchar_t* argv[])
 
 	DWORD_PTR baseAddress = 0;
 
-	// Both paths (shellcode and RemoteThread) must reach the game entry point
-	// before injecting so that hooks are in place before any game code runs.
-	// useRemoteThread only controls HOW we inject, not WHEN.
+	if (underWine || !useRemoteThread)
 	{
 		mycontext.ContextFlags = 0x00010000 + 1 + 2 + 4 + 8 + 0x10;
 		GetThreadContext(pi.hThread, &mycontext);
@@ -395,7 +409,6 @@ int wmain(int argc, wchar_t* argv[])
 
 		Sleep(1000);
 
-		// RunTo now uses suspend-check-resume so it works on Wine too.
 		if (!RunTo(baseAddress + FilePEFile.image_nt_headers.OptionalHeader.AddressOfEntryPoint, 1, 0))
 		{
 			wprintf(L"Failed to run the process\n");
@@ -403,6 +416,12 @@ int wmain(int argc, wchar_t* argv[])
 			(void)_getch();
 			return 1;
 		}
+		wprintf(L"Success!\n");
+	}
+	else
+	{
+		// Windows + RemoteThread: process is suspended, wait briefly for ntdll init.
+		Sleep(1000);
 		wprintf(L"Success!\n");
 	}
 
