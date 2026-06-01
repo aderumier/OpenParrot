@@ -29,9 +29,34 @@ struct TcpState
 static TcpState  s_state    = {};
 static volatile bool s_hasData  = false;
 
-static HANDLE s_thread = NULL;
+static HANDLE s_thread      = NULL;
+static HANDLE s_applyThread = NULL;
 static volatile bool s_running = false;
 static int s_port = 0;
+
+// Dedicated apply thread: reapplies the last TCP state at ~0.1ms intervals
+// using QueryPerformanceCounter so Windows timer resolution doesn't limit us.
+static DWORD WINAPI ApplyThread(LPVOID)
+{
+    LARGE_INTEGER freq, last, now;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&last);
+    // 0.1ms = freq / 10000
+    const LONGLONG interval = freq.QuadPart / 10000;
+
+    while (s_running)
+    {
+        QueryPerformanceCounter(&now);
+        if (now.QuadPart - last.QuadPart >= interval)
+        {
+            ApplyState();
+            last = now;
+        }
+        // Yield without sleeping so we stay within the 0.1ms window.
+        SwitchToThread();
+    }
+    return 0;
+}
 
 static void ApplyState()
 {
@@ -108,36 +133,23 @@ static void HandleClient(SOCKET sock)
 
     while (s_running)
     {
-        // 1 ms timeout so we reapply state every tick even with no new data.
-        fd_set fds;
-        FD_ZERO(&fds);
-        FD_SET(sock, &fds);
-        timeval tv = { 0, 1000 };
+        int n = recv(sock, (char*)buf + buffered, (int)(sizeof(buf) - buffered), 0);
+        if (n <= 0) break;
+        buffered += n;
 
-        if (select(0, &fds, nullptr, nullptr, &tv) > 0)
+        int processed = 0;
+        while (buffered - processed >= TCP_PACKET_SIZE)
         {
-            int n = recv(sock, (char*)buf + buffered, (int)(sizeof(buf) - buffered), 0);
-            if (n <= 0) break;
-            buffered += n;
-
-            int processed = 0;
-            while (buffered - processed >= TCP_PACKET_SIZE)
-            {
-                ParsePacket(buf + processed);
-                processed += TCP_PACKET_SIZE;
-            }
-            if (processed > 0)
-            {
-                int remaining = buffered - processed;
-                if (remaining > 0)
-                    memmove(buf, buf + processed, remaining);
-                buffered = remaining;
-            }
+            ParsePacket(buf + processed);
+            processed += TCP_PACKET_SIZE;
         }
-
-        // Reapply last known state to override any TeknoParrot named-pipe
-        // writes that zero the position between TCP updates.
-        ApplyState();
+        if (processed > 0)
+        {
+            int remaining = buffered - processed;
+            if (remaining > 0)
+                memmove(buf, buf + processed, remaining);
+            buffered = remaining;
+        }
     }
 }
 
@@ -195,16 +207,13 @@ void TcpInputServer_Start(int port)
     if (s_running) return;
     s_port = port;
     s_running = true;
-    s_thread = CreateThread(nullptr, 0, ServerThread, nullptr, 0, nullptr);
+    s_applyThread = CreateThread(nullptr, 0, ApplyThread, nullptr, 0, nullptr);
+    s_thread      = CreateThread(nullptr, 0, ServerThread, nullptr, 0, nullptr);
 }
 
 void TcpInputServer_Stop()
 {
     s_running = false;
-    if (s_thread)
-    {
-        WaitForSingleObject(s_thread, 3000);
-        CloseHandle(s_thread);
-        s_thread = nullptr;
-    }
+    if (s_thread)      { WaitForSingleObject(s_thread,      3000); CloseHandle(s_thread);      s_thread      = nullptr; }
+    if (s_applyThread) { WaitForSingleObject(s_applyThread, 3000); CloseHandle(s_applyThread); s_applyThread = nullptr; }
 }
