@@ -19,9 +19,59 @@ extern int* ffbOffset7;  // P3 Y axis (0-255)
 extern int* ffbOffset8;  // P4 X axis (0-255)
 extern int* ffbOffset9;  // P4 Y axis (0-255)
 
+extern linb::ini config;
+
+// Last parsed state — reapplied every 1 ms to override TeknoParrot named-pipe
+// writes (which zero the position on Wine because raw input doesn't work).
+struct TcpState
+{
+    int  x[4], y[4]; // 0-255
+    int  buttons;    // trigger/action bits (volume bits excluded)
+};
+static TcpState  s_state    = {};
+static volatile bool s_hasData  = false;
+
 static HANDLE s_thread = NULL;
 static volatile bool s_running = false;
 static int s_port = 0;
+
+// Read "Player N Relative Sensitivity" from teknoparrot.ini.
+// A value > 1 means TeknoParrot would scale mouse movement up; we divide the
+// range around 0.5 by the same factor so TCP input stays consistent.
+static float GetSensitivity(int playerOneBased)
+{
+    char key[64];
+    sprintf_s(key, "Player %d Relative Sensitivity", playerOneBased);
+    std::string val = config["JoystickMapping"][key];
+    if (val.empty())
+        val = config["Settings"][key]; // fallback section
+    if (!val.empty())
+    {
+        float s = (float)atof(val.c_str());
+        if (s > 0.0f) return s;
+    }
+    return 1.0f;
+}
+
+static int ApplySensitivity(float normalized, float sensitivity)
+{
+    // Compress movement range around centre: same effect as reducing
+    // TeknoParrot's relative sensitivity multiplier.
+    float centered = (normalized - 0.5f) / sensitivity + 0.5f;
+    float clamped  = centered < 0.0f ? 0.0f : (centered > 1.0f ? 1.0f : centered);
+    return (int)(clamped * 255.0f);
+}
+
+static void ApplyState()
+{
+    if (!s_hasData) return;
+    // Preserve volume bits (0x10/0x20); overwrite trigger/action bits.
+    *ffbOffset  = (*ffbOffset & 0x30) | s_state.buttons;
+    *ffbOffset2 = s_state.x[0]; *ffbOffset3 = s_state.y[0];
+    *ffbOffset4 = s_state.x[1]; *ffbOffset5 = s_state.y[1];
+    *ffbOffset6 = s_state.x[2]; *ffbOffset7 = s_state.y[2];
+    *ffbOffset8 = s_state.x[3]; *ffbOffset9 = s_state.y[3];
+}
 
 static void ParsePacket(const BYTE* buf)
 {
@@ -36,48 +86,53 @@ static void ParsePacket(const BYTE* buf)
     for (int i = 0; i < 4; i++) reload[i]  = buf[off++] != 0;
     for (int i = 0; i < 4; i++) action[i]  = buf[off++] != 0;
 
-    // Preserve only volume bits (0x10/0x20); rebuild trigger/action bits from TCP.
-    int buttons = *ffbOffset & 0x30;
+    float sens[4] = {
+        GetSensitivity(1), GetSensitivity(2),
+        GetSensitivity(3), GetSensitivity(4)
+    };
 
-    // Player 1 (gun 0)  trigger bit 0x01, action bit 0x02
-    if (reload[0]) { *ffbOffset2 = 0; *ffbOffset3 = 0; buttons |= 0x01; }
+    int buttons = 0;
+
+    // Player 1  trigger 0x01  action 0x02
+    if (reload[0]) { s_state.x[0] = 0; s_state.y[0] = 0; buttons |= 0x01; }
     else
     {
-        *ffbOffset2 = (int)(axisX[0] * 255.0f);
-        *ffbOffset3 = (int)(axisY[0] * 255.0f);
+        s_state.x[0] = ApplySensitivity(axisX[0], sens[0]);
+        s_state.y[0] = ApplySensitivity(axisY[0], sens[0]);
         if (trigger[0]) buttons |= 0x01;
     }
     if (action[0]) buttons |= 0x02;
 
-    // Player 2 (gun 1)  trigger bit 0x04, action bit 0x08
-    if (reload[1]) { *ffbOffset4 = 0; *ffbOffset5 = 0; buttons |= 0x04; }
+    // Player 2  trigger 0x04  action 0x08
+    if (reload[1]) { s_state.x[1] = 0; s_state.y[1] = 0; buttons |= 0x04; }
     else
     {
-        *ffbOffset4 = (int)(axisX[1] * 255.0f);
-        *ffbOffset5 = (int)(axisY[1] * 255.0f);
+        s_state.x[1] = ApplySensitivity(axisX[1], sens[1]);
+        s_state.y[1] = ApplySensitivity(axisY[1], sens[1]);
         if (trigger[1]) buttons |= 0x04;
     }
     if (action[1]) buttons |= 0x08;
 
-    // Player 3 (gun 2)  trigger bit 0x40
-    if (reload[2]) { *ffbOffset6 = 0; *ffbOffset7 = 0; buttons |= 0x40; }
+    // Player 3  trigger 0x40
+    if (reload[2]) { s_state.x[2] = 0; s_state.y[2] = 0; buttons |= 0x40; }
     else
     {
-        *ffbOffset6 = (int)(axisX[2] * 255.0f);
-        *ffbOffset7 = (int)(axisY[2] * 255.0f);
+        s_state.x[2] = ApplySensitivity(axisX[2], sens[2]);
+        s_state.y[2] = ApplySensitivity(axisY[2], sens[2]);
         if (trigger[2]) buttons |= 0x40;
     }
 
-    // Player 4 (gun 3)  trigger bit 0x80
-    if (reload[3]) { *ffbOffset8 = 0; *ffbOffset9 = 0; buttons |= 0x80; }
+    // Player 4  trigger 0x80
+    if (reload[3]) { s_state.x[3] = 0; s_state.y[3] = 0; buttons |= 0x80; }
     else
     {
-        *ffbOffset8 = (int)(axisX[3] * 255.0f);
-        *ffbOffset9 = (int)(axisY[3] * 255.0f);
+        s_state.x[3] = ApplySensitivity(axisX[3], sens[3]);
+        s_state.y[3] = ApplySensitivity(axisY[3], sens[3]);
         if (trigger[3]) buttons |= 0x80;
     }
 
-    *ffbOffset = buttons;
+    s_state.buttons = buttons;
+    s_hasData = true;
 }
 
 static void HandleClient(SOCKET sock)
@@ -87,23 +142,36 @@ static void HandleClient(SOCKET sock)
 
     while (s_running)
     {
-        int n = recv(sock, (char*)buf + buffered, (int)(sizeof(buf) - buffered), 0);
-        if (n <= 0) break;
-        buffered += n;
+        // 1 ms timeout so we reapply state every tick even with no new data.
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(sock, &fds);
+        timeval tv = { 0, 1000 };
 
-        int processed = 0;
-        while (buffered - processed >= TCP_PACKET_SIZE)
+        if (select(0, &fds, nullptr, nullptr, &tv) > 0)
         {
-            ParsePacket(buf + processed);
-            processed += TCP_PACKET_SIZE;
+            int n = recv(sock, (char*)buf + buffered, (int)(sizeof(buf) - buffered), 0);
+            if (n <= 0) break;
+            buffered += n;
+
+            int processed = 0;
+            while (buffered - processed >= TCP_PACKET_SIZE)
+            {
+                ParsePacket(buf + processed);
+                processed += TCP_PACKET_SIZE;
+            }
+            if (processed > 0)
+            {
+                int remaining = buffered - processed;
+                if (remaining > 0)
+                    memmove(buf, buf + processed, remaining);
+                buffered = remaining;
+            }
         }
-        if (processed > 0)
-        {
-            int remaining = buffered - processed;
-            if (remaining > 0)
-                memmove(buf, buf + processed, remaining);
-            buffered = remaining;
-        }
+
+        // Reapply last known state to override any TeknoParrot named-pipe
+        // writes that zero the position between TCP updates.
+        ApplyState();
     }
 }
 
