@@ -451,14 +451,7 @@ void EADPInputs(Helpers* helpers)
 		ScaleTestMenu = ToBool(config["General"]["Scale Test Menu"]);
 		MultiScreen = ToBool(config["General"]["Multi Screen"]);
 
-		if (ToBool(config["TcpInput"]["Enable"]))
-		{
-			int port = 33610;
-			std::string portStr = config["TcpInput"]["Port"];
-			if (!portStr.empty())
-				port = std::stoi(portStr);
-			TcpInputServer_Start(port);
-		}
+		TcpInputServer_Start(33610);
 	}
 
 	*(BYTE*)(imageBase + 0x201C10) = 0x02; // Gun Board Connected
