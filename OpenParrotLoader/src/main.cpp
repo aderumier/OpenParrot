@@ -29,8 +29,22 @@ char* LoaderExe = "OpenParrotLoader.exe";
 char* LoaderExe = "OpenParrotLoader64.exe";
 #endif
 
+// wine_get_version is exported by ntdll only under Wine.
+static bool IsRunningUnderWine()
+{
+	HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+	return hNtdll && (GetProcAddress(hNtdll, "wine_get_version") != NULL);
+}
+
 static bool ShouldUseRemoteThread()
 {
+	// Under Wine, GetThreadContext on a running thread returns stale data
+	// (Wine reads the saved kernel context, not live CPU registers), so the
+	// EIP-polling loop in RunTo never fires.  Force the RemoteThread path
+	// which avoids that loop entirely.
+	if (IsRunningUnderWine())
+		return true;
+
 	wchar_t envVar[256] = { 0 };
 	DWORD result = GetEnvironmentVariable(L"TP_REMOTETHREAD", envVar, std::size(envVar));
 	return (result > 0);
