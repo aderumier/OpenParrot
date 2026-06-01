@@ -19,8 +19,6 @@ extern int* ffbOffset7;  // P3 Y axis (0-255)
 extern int* ffbOffset8;  // P4 X axis (0-255)
 extern int* ffbOffset9;  // P4 Y axis (0-255)
 
-extern linb::ini config;
-
 // Last parsed state — reapplied every 1 ms to override TeknoParrot named-pipe
 // writes (which zero the position on Wine because raw input doesn't work).
 struct TcpState
@@ -34,31 +32,6 @@ static volatile bool s_hasData  = false;
 static HANDLE s_thread = NULL;
 static volatile bool s_running = false;
 static int s_port = 0;
-
-// Read "Player N Relative Sensitivity" from teknoparrot.ini.
-// A value > 1 means TeknoParrot would scale mouse movement up; we divide the
-// range around 0.5 by the same factor so TCP input stays consistent.
-static float GetSensitivity(int playerOneBased)
-{
-    char key[64];
-    sprintf_s(key, "Player %d Relative Sensitivity", playerOneBased);
-    std::string val = config["General"][key];
-    if (!val.empty())
-    {
-        float s = (float)atof(val.c_str());
-        if (s > 0.0f) return s;
-    }
-    return 1.0f;
-}
-
-static int ApplySensitivity(float normalized, float sensitivity)
-{
-    // Compress movement range around centre: same effect as reducing
-    // TeknoParrot's relative sensitivity multiplier.
-    float centered = (normalized - 0.5f) / sensitivity + 0.5f;
-    float clamped  = centered < 0.0f ? 0.0f : (centered > 1.0f ? 1.0f : centered);
-    return (int)(clamped * 255.0f);
-}
 
 static void ApplyState()
 {
@@ -84,19 +57,14 @@ static void ParsePacket(const BYTE* buf)
     for (int i = 0; i < 4; i++) reload[i]  = buf[off++] != 0;
     for (int i = 0; i < 4; i++) action[i]  = buf[off++] != 0;
 
-    float sens[4] = {
-        GetSensitivity(1), GetSensitivity(2),
-        GetSensitivity(3), GetSensitivity(4)
-    };
-
     int buttons = 0;
 
     // Player 1  trigger 0x01  action 0x02
     if (reload[0]) { s_state.x[0] = 0; s_state.y[0] = 0; buttons |= 0x01; }
     else
     {
-        s_state.x[0] = ApplySensitivity(axisX[0], sens[0]);
-        s_state.y[0] = ApplySensitivity(axisY[0], sens[0]);
+        s_state.x[0] = (int)(axisX[0] * 255.0f);
+        s_state.y[0] = (int)(axisY[0] * 255.0f);
         if (trigger[0]) buttons |= 0x01;
     }
     if (action[0]) buttons |= 0x02;
@@ -105,8 +73,8 @@ static void ParsePacket(const BYTE* buf)
     if (reload[1]) { s_state.x[1] = 0; s_state.y[1] = 0; buttons |= 0x04; }
     else
     {
-        s_state.x[1] = ApplySensitivity(axisX[1], sens[1]);
-        s_state.y[1] = ApplySensitivity(axisY[1], sens[1]);
+        s_state.x[1] = (int)(axisX[1] * 255.0f);
+        s_state.y[1] = (int)(axisY[1] * 255.0f);
         if (trigger[1]) buttons |= 0x04;
     }
     if (action[1]) buttons |= 0x08;
@@ -115,8 +83,8 @@ static void ParsePacket(const BYTE* buf)
     if (reload[2]) { s_state.x[2] = 0; s_state.y[2] = 0; buttons |= 0x40; }
     else
     {
-        s_state.x[2] = ApplySensitivity(axisX[2], sens[2]);
-        s_state.y[2] = ApplySensitivity(axisY[2], sens[2]);
+        s_state.x[2] = (int)(axisX[2] * 255.0f);
+        s_state.y[2] = (int)(axisY[2] * 255.0f);
         if (trigger[2]) buttons |= 0x40;
     }
 
@@ -124,8 +92,8 @@ static void ParsePacket(const BYTE* buf)
     if (reload[3]) { s_state.x[3] = 0; s_state.y[3] = 0; buttons |= 0x80; }
     else
     {
-        s_state.x[3] = ApplySensitivity(axisX[3], sens[3]);
-        s_state.y[3] = ApplySensitivity(axisY[3], sens[3]);
+        s_state.x[3] = (int)(axisX[3] * 255.0f);
+        s_state.y[3] = (int)(axisY[3] * 255.0f);
         if (trigger[3]) buttons |= 0x80;
     }
 
