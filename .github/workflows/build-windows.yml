@@ -1,0 +1,50 @@
+name: Build (Windows)
+
+on:
+  push:
+    branches: [ "test", "master" ]
+  pull_request:
+    branches: [ "test", "master" ]
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: windows-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [ Win32, x64 ]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Generate Visual Studio solution
+        shell: cmd
+        run: premake5.exe vs2019
+
+      - name: Create output directory
+        shell: cmd
+        run: if not exist build\bin\release\output mkdir build\bin\release\output
+
+      - name: Build
+        shell: cmd
+        run: |
+          msbuild OpenParrot.sln ^
+            /p:Configuration=Release ^
+            /p:Platform=${{ matrix.platform }} ^
+            /m ^
+            /verbosity:minimal
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenParrot-${{ matrix.platform }}
+          path: build/bin/release/output/
+          if-no-files-found: warn
