@@ -42,9 +42,7 @@ static float GetSensitivity(int playerOneBased)
 {
     char key[64];
     sprintf_s(key, "Player %d Relative Sensitivity", playerOneBased);
-    std::string val = config["JoystickMapping"][key];
-    if (val.empty())
-        val = config["Settings"][key]; // fallback section
+    std::string val = config["General"][key];
     if (!val.empty())
     {
         float s = (float)atof(val.c_str());
