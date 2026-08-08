@@ -20,6 +20,7 @@ static bool previousLeft = false;
 static bool previousRight = false;
 static bool previousUp = false;
 static bool previousDown = false;
+static bool startPressed = false;
 static bool button1pressed = false;
 static bool button2pressed = false;
 static bool button3pressed = false;
@@ -38,6 +39,7 @@ DWORD WINAPI InputRT(LPVOID lpParam)
 {
 	int deltaTimer = 16;
 	INT_PTR keyboardBuffer = (0x41B5920 + BaseAddress);
+	const bool androidTouchInput = getenv("ANDROID_ALSA_SERVER") != nullptr;
 
 	while (true)
 	{
@@ -45,8 +47,17 @@ DWORD WINAPI InputRT(LPVOID lpParam)
 		// START 
 		if (*ffbOffset & 0x08)
 		{
-			injector::WriteMemory<BYTE>((keyboardBuffer + DIK_SPACE), 2, true);
+			// The game's keyboard buffer is event-oriented. A touchscreen press
+			// spans several polling frames, so rewriting SPACE every 16 ms can
+			// enqueue multiple transitions and leave the Press Start state stuck.
+			// Preserve the established desktop behavior and emit one event per
+			// Android touch press.
+			if (!androidTouchInput || !startPressed)
+				injector::WriteMemory<BYTE>((keyboardBuffer + DIK_SPACE), 2, true);
+			startPressed = true;
 		}
+		else
+			startPressed = false;
 		// TEST
 		if (*ffbOffset & 0x01)
 		{

@@ -2,6 +2,7 @@
 #include "Utility/InitFunction.h"
 #include "Functions/Global.h"
 #include <deque>
+#include <d3d9.h>
 // BASED ON xb_monitor by zxmarcos https://github.com/zxmarcos/xb_monitor
 #if _M_IX86
 
@@ -28,6 +29,150 @@ static bool ShouldForceSoftwareDirectSoundExBoard()
 	const DWORD length = GetEnvironmentVariableA(
 		"TP_EXBOARD_SOFTWARE_DSOUND", value, static_cast<DWORD>(sizeof(value)));
 	return length == 1 && value[0] == '1';
+}
+
+static bool IsDaemonBrideExBoard()
+{
+	char modulePath[MAX_PATH] = {};
+	if (GetModuleFileNameA(nullptr, modulePath, _countof(modulePath)) == 0)
+		return false;
+
+	const char* fileName = strrchr(modulePath, '\\');
+	fileName = fileName == nullptr ? modulePath : fileName + 1;
+	return _stricmp(fileName, "DB1.exe") == 0;
+}
+
+static const char* ResolveDaemonBrideFlashRomPath(LPCSTR fileName)
+{
+	if (fileName == nullptr)
+		return nullptr;
+
+	constexpr size_t prefixLength = 9;
+	if (_strnicmp(fileName, "FlashRom\\", prefixLength) != 0 &&
+		_strnicmp(fileName, "FlashRom/", prefixLength) != 0)
+		return nullptr;
+	if (!IsDaemonBrideExBoard())
+		return nullptr;
+
+	const char* relativePath = fileName + prefixLength;
+	return GetFileAttributesA(fileName) == INVALID_FILE_ATTRIBUTES &&
+		GetFileAttributesA(relativePath) != INVALID_FILE_ATTRIBUTES
+		? relativePath
+		: nullptr;
+}
+
+static bool IsExBoardRunningUnderWine()
+{
+	const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+	return ntdll != nullptr &&
+		GetProcAddress(ntdll, "wine_get_version") != nullptr;
+}
+
+// DB1 renders into a 16-bit R5G6B5 D3D9 back buffer.  Under Wine/DXVK the
+// unwrapped Present path can keep the X11 surface black even though the game
+// continues presenting at 60 Hz.  A no-state-change Present trampoline makes
+// the surface visible.  Keep this DB1 + Wine scoped so native Windows retains
+// its original D3D9 path.
+static decltype(&Direct3DCreate9) DaemonBrideDirect3DCreate9Original = nullptr;
+using DaemonBrideCreateDevice = HRESULT(WINAPI*)(
+	IDirect3D9*, UINT, D3DDEVTYPE, HWND, DWORD,
+	D3DPRESENT_PARAMETERS*, IDirect3DDevice9**);
+using DaemonBridePresent = HRESULT(WINAPI*)(
+	IDirect3DDevice9*, const RECT*, const RECT*, HWND, const RGNDATA*);
+
+static DaemonBrideCreateDevice DaemonBrideCreateDeviceOriginal = nullptr;
+static DaemonBridePresent DaemonBridePresentOriginal = nullptr;
+
+static void InstallDaemonBrideD3D9VtableHook(
+	void** vtable,
+	size_t index,
+	void* hook,
+	void** original)
+{
+	if (vtable == nullptr || hook == nullptr || original == nullptr)
+		return;
+	if (*original == nullptr)
+		*original = vtable[index];
+	if (vtable[index] == hook)
+		return;
+
+	DWORD oldProtection = 0;
+	if (!VirtualProtect(
+			&vtable[index],
+			sizeof(vtable[index]),
+			PAGE_EXECUTE_READWRITE,
+			&oldProtection))
+		return;
+	vtable[index] = hook;
+	DWORD ignored = 0;
+	VirtualProtect(
+		&vtable[index],
+		sizeof(vtable[index]),
+		oldProtection,
+		&ignored);
+	FlushInstructionCache(
+		GetCurrentProcess(),
+		&vtable[index],
+		sizeof(vtable[index]));
+}
+
+static HRESULT WINAPI DaemonBridePresentHook(
+	IDirect3DDevice9* device,
+	const RECT* sourceRect,
+	const RECT* destinationRect,
+	HWND destinationWindowOverride,
+	const RGNDATA* dirtyRegion)
+{
+	return DaemonBridePresentOriginal(
+		device,
+		sourceRect,
+		destinationRect,
+		destinationWindowOverride,
+		dirtyRegion);
+}
+
+static HRESULT WINAPI DaemonBrideCreateDeviceHook(
+	IDirect3D9* direct3D,
+	UINT adapter,
+	D3DDEVTYPE deviceType,
+	HWND focusWindow,
+	DWORD behaviorFlags,
+	D3DPRESENT_PARAMETERS* parameters,
+	IDirect3DDevice9** returnedDevice)
+{
+	const HRESULT result = DaemonBrideCreateDeviceOriginal(
+		direct3D,
+		adapter,
+		deviceType,
+		focusWindow,
+		behaviorFlags,
+		parameters,
+		returnedDevice);
+	if (SUCCEEDED(result) && returnedDevice != nullptr && *returnedDevice != nullptr)
+	{
+		void** vtable = *reinterpret_cast<void***>(*returnedDevice);
+		InstallDaemonBrideD3D9VtableHook(
+			vtable,
+			17,
+			reinterpret_cast<void*>(DaemonBridePresentHook),
+			reinterpret_cast<void**>(&DaemonBridePresentOriginal));
+	}
+	return result;
+}
+
+static IDirect3D9* WINAPI DaemonBrideDirect3DCreate9Hook(UINT sdkVersion)
+{
+	IDirect3D9* result = DaemonBrideDirect3DCreate9Original(sdkVersion);
+	if (result != nullptr)
+	{
+		void** vtable = *reinterpret_cast<void***>(result);
+		InstallDaemonBrideD3D9VtableHook(
+			vtable,
+			16,
+			reinterpret_cast<void*>(DaemonBrideCreateDeviceHook),
+			reinterpret_cast<void**>(&DaemonBrideCreateDeviceOriginal));
+	}
+	return result;
 }
 
 void SRAM_save()
@@ -222,6 +367,22 @@ static HANDLE __stdcall CreateFileAWrapExBoard(LPCSTR lpFileName,
 		AddCommOverride(hFile);
 
 		return hFile;
+	}
+
+	// Some Daemon Bride dumps store the eX-Board FlashRom payload directly
+	// beside DB1.exe (for example font/font_dat.tbl).  The original executable
+	// still prefixes those reads with FlashRom/ and otherwise spins forever on
+	// the first missing font table.  Preserve a real FlashRom tree when present
+	// and fall back only when the exact unprefixed file exists.
+	if (const char* redirectedPath = ResolveDaemonBrideFlashRomPath(lpFileName))
+	{
+		return CreateFileA(redirectedPath,
+			dwDesiredAccess,
+			dwShareMode,
+			lpSecurityAttributes,
+			dwCreationDisposition,
+			dwFlagsAndAttributes,
+			hTemplateFile);
 	}
 
 	return CreateFileA(lpFileName,
@@ -438,6 +599,14 @@ HWND __stdcall CreateWindowExAWrap(DWORD dwExStyle,
 
 static InitFunction ExBoardGenericFunc([]()
 {
+	if (IsDaemonBrideExBoard() && IsExBoardRunningUnderWine())
+	{
+		DaemonBrideDirect3DCreate9Original = iatHook(
+			"d3d9.dll",
+			DaemonBrideDirect3DCreate9Hook,
+			"Direct3DCreate9");
+	}
+
 	if (ShouldForceSoftwareDirectSoundExBoard())
 	{
 		const uintptr_t imageBase = reinterpret_cast<uintptr_t>(GetModuleHandle(nullptr));

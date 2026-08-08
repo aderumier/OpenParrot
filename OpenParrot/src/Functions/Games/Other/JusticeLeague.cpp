@@ -40,6 +40,91 @@ static DWORD justiceLeagueLuaIntegerGuardReturn = 0;
 static DWORD justiceLeagueLuaIntegerGuardInvalid = 0;
 static DWORD justiceLeagueLuaArrayGuardReturn = 0;
 static DWORD justiceLeagueLuaArrayGuardInvalid = 0;
+static DWORD justiceLeagueLuaConversionSites[4] = {};
+static constexpr BYTE justiceLeagueLuaConversionDestinations[4] =
+	{ 0x04, 0x10, 0x14, 0x08 };
+static PVOID justiceLeagueLuaExceptionHandler = nullptr;
+static constexpr DWORD justiceLeagueFloatMultipleFaults = 0xC00002B4;
+static constexpr DWORD justiceLeagueFloatMultipleTraps = 0xC00002B5;
+
+static LONG CALLBACK JusticeLeagueLuaFpuExceptionRecovery(
+	PEXCEPTION_POINTERS exceptionPointers)
+{
+	if (!exceptionPointers ||
+		!exceptionPointers->ExceptionRecord ||
+		!exceptionPointers->ContextRecord)
+		return EXCEPTION_CONTINUE_SEARCH;
+
+	const DWORD exceptionCode =
+		exceptionPointers->ExceptionRecord->ExceptionCode;
+	if (exceptionCode != EXCEPTION_FLT_INVALID_OPERATION &&
+		exceptionCode != justiceLeagueFloatMultipleFaults &&
+		exceptionCode != justiceLeagueFloatMultipleTraps)
+		return EXCEPTION_CONTINUE_SEARCH;
+
+	CONTEXT* context = exceptionPointers->ContextRecord;
+	const DWORD exceptionIp = context->Eip;
+	for (size_t index = 0;
+		index < _countof(justiceLeagueLuaConversionSites);
+		++index)
+	{
+		if (exceptionIp != justiceLeagueLuaConversionSites[index])
+			continue;
+
+		const BYTE expectedInstruction[] = {
+			0xDB,
+			0x5C,
+			0x24,
+			justiceLeagueLuaConversionDestinations[index]
+		};
+		if (memcmp(
+				reinterpret_cast<const void*>(exceptionIp),
+				expectedInstruction,
+				sizeof(expectedInstruction)) != 0)
+			return EXCEPTION_CONTINUE_SEARCH;
+
+		// Clear the live emulated x87 state as well as the CONTEXT copies below.
+		// Without this, Box64 can carry the handled pending exception into Wine's
+		// WOW64 transition even though execution resumes past the FISTP site.
+		_clearfp();
+		unsigned int controlWord = 0;
+		_controlfp_s(&controlWord, _MCW_EM, _MCW_EM);
+
+		// Match a masked x87 invalid conversion on Windows: store the integer
+		// indefinite value, pop ST(0), clear the saved exception state, and
+		// resume at the following FILD instruction. Updating both context copies
+		// is required because Wine restores the FXSAVE image on continuation.
+		const DWORD integerIndefinite = 0x80000000u;
+		memcpy(
+			reinterpret_cast<void*>(
+				context->Esp + justiceLeagueLuaConversionDestinations[index]),
+			&integerIndefinite,
+			sizeof(integerIndefinite));
+
+		const DWORD oldTop = (context->FloatSave.StatusWord >> 11) & 7;
+		const DWORD newTop = (oldTop + 1) & 7;
+		context->FloatSave.ControlWord |= 0x3F;
+		context->FloatSave.StatusWord =
+			(context->FloatSave.StatusWord & ~(0xFF | (7 << 11))) |
+			(newTop << 11);
+		context->FloatSave.TagWord |= 3 << (oldTop * 2);
+
+		BYTE* extendedRegisters = context->ExtendedRegisters;
+		*reinterpret_cast<WORD*>(extendedRegisters) |= 0x3F;
+		WORD* savedStatus = reinterpret_cast<WORD*>(extendedRegisters + 2);
+		*savedStatus = static_cast<WORD>(
+			(*savedStatus & ~(0xFF | (7 << 11))) | (newTop << 11));
+		extendedRegisters[4] &= ~(1 << oldTop);
+		DWORD* savedMxCsr =
+			reinterpret_cast<DWORD*>(extendedRegisters + 24);
+		*savedMxCsr = (*savedMxCsr | 0x1F80) & ~0x3F;
+
+		context->Eip += sizeof(expectedInstruction);
+		return EXCEPTION_CONTINUE_EXECUTION;
+	}
+
+	return EXCEPTION_CONTINUE_SEARCH;
+}
 
 static D3DXMATRIX* WINAPI JusticeLeaguePerspectiveFovLHGuard(
 	D3DXMATRIX* output,
@@ -135,16 +220,28 @@ static ULONGLONG __cdecl JusticeLeagueTruncateLuaDoubleBits(
 	if (exponent == 0x7FF)
 		return packResult(invalidResult, false);
 
+	const ULONGLONG bits =
+		(static_cast<ULONGLONG>(highBits) << 32) | lowBits;
+	const ULONGLONG fraction = bits & mantissaMask;
 	const int power = static_cast<int>(exponent) - 1023;
 	if (power < 0)
-		return packResult(0, true);
+	{
+		// The Lua call sites accept only exact integers. Positive and negative
+		// zero are the only integral IEEE-754 values with an exponent below 0.
+		return packResult(0, exponent == 0 && fraction == 0);
+	}
 	if (power > 31)
 		return packResult(invalidResult, false);
 
-	const ULONGLONG bits =
-		(static_cast<ULONGLONG>(highBits) << 32) | lowBits;
 	const ULONGLONG significand =
-		implicitBit | (bits & mantissaMask);
+		implicitBit | fraction;
+	if (power < 52)
+	{
+		const ULONGLONG fractionalMask =
+			(1ULL << (52 - power)) - 1;
+		if ((significand & fractionalMask) != 0)
+			return packResult(invalidResult, false);
+	}
 	const ULONGLONG magnitude = significand >> (52 - power);
 	const bool negative = (highBits & 0x80000000u) != 0;
 
@@ -165,11 +262,9 @@ static void __declspec(naked) JusticeLeagueLuaIntegerGuard()
 {
 	__asm
 	{
-		// Box64 raises on both masked x87 FISTP and masked SSE2 CVTTSD2SI
-		// for this Lua NaN. Pop the already-loaded x87 value and reproduce
-		// Windows' truncation result from its IEEE-754 bits using integer
-		// operations only.
-		fstp st(0)
+		// Enter before the original FLD so Box64 never observes a pending x87
+		// invalid conversion. Reproduce the exact-integer test from the source
+		// double's IEEE-754 bits using integer operations only.
 		push eax
 		push ecx
 		push edx
@@ -183,7 +278,6 @@ static void __declspec(naked) JusticeLeagueLuaIntegerGuard()
 		pop edx
 		pop ecx
 		pop eax
-		fild dword ptr[esp + 14h]
 		jmp dword ptr[justiceLeagueLuaIntegerGuardReturn]
 	invalidConversion:
 		pop edx
@@ -197,7 +291,6 @@ static void __declspec(naked) JusticeLeagueLuaCompactGuard()
 {
 	__asm
 	{
-		fstp st(0)
 		push eax
 		push ecx
 		push edx
@@ -211,7 +304,6 @@ static void __declspec(naked) JusticeLeagueLuaCompactGuard()
 		pop edx
 		pop ecx
 		pop eax
-		fild dword ptr[esp + 04h]
 		jmp dword ptr[justiceLeagueLuaCompactGuardReturn]
 	invalidConversion:
 		pop edx
@@ -225,7 +317,6 @@ static void __declspec(naked) JusticeLeagueLuaIndexGuard()
 {
 	__asm
 	{
-		fstp st(0)
 		push eax
 		push ecx
 		push edx
@@ -239,7 +330,6 @@ static void __declspec(naked) JusticeLeagueLuaIndexGuard()
 		pop edx
 		pop ecx
 		pop eax
-		fild dword ptr[esp + 10h]
 		jmp dword ptr[justiceLeagueLuaIndexGuardReturn]
 	invalidConversion:
 		pop edx
@@ -253,9 +343,8 @@ static void __declspec(naked) JusticeLeagueLuaArrayGuard()
 {
 	__asm
 	{
-		// Same masked x87 conversion used by the Lua array-index validator,
+		// Same integer-only validation used by the Lua array-index validator,
 		// with the source qword and destination dword in different stack slots.
-		fstp st(0)
 		push eax
 		push ecx
 		push edx
@@ -269,7 +358,6 @@ static void __declspec(naked) JusticeLeagueLuaArrayGuard()
 		pop edx
 		pop ecx
 		pop eax
-		fild dword ptr[esp + 08h]
 		jmp dword ptr[justiceLeagueLuaArrayGuardReturn]
 	invalidConversion:
 		pop edx
@@ -289,8 +377,14 @@ static DWORD WINAPI InstallJusticeLeagueAspectGuard(LPVOID)
 			Sleep(10);
 	}
 
+	// Keep the D3DX export replacement opt-in on Android. Patching Wine's
+	// relocated D3DX implementation while Box64 is translating its startup path
+	// can invalidate a live translation block. The renderer and Lua call-site
+	// guards below avoid the observed traps without rewriting Wine code.
+	const bool installD3dxGuard =
+		getenv("TP_JUSTICE_D3DX_GUARD") != nullptr;
 	HMODULE d3dx = GetModuleHandleA("d3dx9_32.dll");
-	if (d3dx != nullptr)
+	if (installD3dxGuard && d3dx != nullptr)
 	{
 		auto perspectiveFovLH = GetProcAddress(
 			d3dx,
@@ -334,66 +428,54 @@ static DWORD WINAPI InstallJusticeLeagueAspectGuard(LPVOID)
 		auto luaCompactGuardSite = hook::module_pattern(
 			lua,
 			"DD 44 24 08 DB 5C 24 04 DB 44 24 04 DD 44 24 08 DA E9")
-			.get_first<DWORD>(4);
+			.get_first<DWORD>();
 		justiceLeagueLuaCompactGuardReturn =
-			reinterpret_cast<DWORD>(luaCompactGuardSite) + 8;
+			reinterpret_cast<DWORD>(luaCompactGuardSite) + 0x19;
 		justiceLeagueLuaCompactGuardInvalid =
-			reinterpret_cast<DWORD>(luaCompactGuardSite) + 0x2A;
+			reinterpret_cast<DWORD>(luaCompactGuardSite) + 0x2E;
 		injector::MakeJMP(
 			luaCompactGuardSite,
 			JusticeLeagueLuaCompactGuard,
 			true);
-		injector::MakeNOP(
-			reinterpret_cast<DWORD>(luaCompactGuardSite) + 5,
-			3);
 
 		auto luaIndexGuardSite = hook::module_pattern(
 			lua,
 			"DD 44 24 18 DB 5C 24 10 DB 44 24 10 DD 44 24 18 DA E9")
-			.get_first<DWORD>(4);
+			.get_first<DWORD>();
 		justiceLeagueLuaIndexGuardReturn =
-			reinterpret_cast<DWORD>(luaIndexGuardSite) + 8;
+			reinterpret_cast<DWORD>(luaIndexGuardSite) + 0x19;
 		justiceLeagueLuaIndexGuardInvalid =
-			reinterpret_cast<DWORD>(luaIndexGuardSite) + 0x41;
+			reinterpret_cast<DWORD>(luaIndexGuardSite) + 0x45;
 		injector::MakeJMP(
 			luaIndexGuardSite,
 			JusticeLeagueLuaIndexGuard,
 			true);
-		injector::MakeNOP(
-			reinterpret_cast<DWORD>(luaIndexGuardSite) + 5,
-			3);
 
 		auto luaIntegerGuardSite = hook::module_pattern(
 			lua,
 			"DD 44 24 04 DB 5C 24 14 DB 44 24 14 DD 07 DA E9")
-			.get_first<DWORD>(4);
+			.get_first<DWORD>();
 		justiceLeagueLuaIntegerGuardReturn =
-			reinterpret_cast<DWORD>(luaIntegerGuardSite) + 8;
+			reinterpret_cast<DWORD>(luaIntegerGuardSite) + 0x17;
 		justiceLeagueLuaIntegerGuardInvalid =
-			reinterpret_cast<DWORD>(luaIntegerGuardSite) + 0x24;
+			reinterpret_cast<DWORD>(luaIntegerGuardSite) + 0x28;
 		injector::MakeJMP(
 			luaIntegerGuardSite,
 			JusticeLeagueLuaIntegerGuard,
 			true);
-		injector::MakeNOP(
-			reinterpret_cast<DWORD>(luaIntegerGuardSite) + 5,
-			3);
 
 		auto luaArrayGuardSite = hook::module_pattern(
 			lua,
 			"DD 44 24 0C DB 5C 24 08 DB 44 24 08 DD 44 24 0C DA E9")
-			.get_first<DWORD>(4);
+			.get_first<DWORD>();
 		justiceLeagueLuaArrayGuardReturn =
-			reinterpret_cast<DWORD>(luaArrayGuardSite) + 8;
+			reinterpret_cast<DWORD>(luaArrayGuardSite) + 0x19;
 		justiceLeagueLuaArrayGuardInvalid =
-			reinterpret_cast<DWORD>(luaArrayGuardSite) + 0x3E;
+			reinterpret_cast<DWORD>(luaArrayGuardSite) + 0x42;
 		injector::MakeJMP(
 			luaArrayGuardSite,
 			JusticeLeagueLuaArrayGuard,
 			true);
-		injector::MakeNOP(
-			reinterpret_cast<DWORD>(luaArrayGuardSite) + 5,
-			3);
 	}
 	return 0;
 }
@@ -557,6 +639,11 @@ static InitFunction JLeagueFunc([]()
 {
 	GetDesktopResolution(horizontal8, vertical8);
 
+	if (getenv("ANDROID_ALSA_SERVER") != nullptr)
+	{
+		CreateThread(NULL, 0, InstallJusticeLeagueAspectGuard, NULL, 0, NULL);
+	}
+
 	CreateThread(NULL, 0, InputRT8, NULL, 0, NULL);
 
 	MH_Initialize();
@@ -565,7 +652,12 @@ static InitFunction JLeagueFunc([]()
 	MH_CreateHookApi(L"user32.dll", "SetWindowPos", &SetWindowPosRT8, (void**)& original_SetWindowPos8);
 	MH_EnableHook(MH_ALL_HOOKS);
 
-	if (ToBool(config["General"]["Windowed"]))
+	// The optional mouse drag/minimize helper enters User32 from a secondary
+	// thread while Wine is still bringing up Winex11. It is not useful with the
+	// Android touch overlay and can race Winex11 initialization, so keep the
+	// established helper only on native Windows.
+	if (ToBool(config["General"]["Windowed"]) &&
+		getenv("ANDROID_ALSA_SERVER") == nullptr)
 	{
 		CreateThread(NULL, 0, WindowRT8, NULL, 0, NULL);
 	}

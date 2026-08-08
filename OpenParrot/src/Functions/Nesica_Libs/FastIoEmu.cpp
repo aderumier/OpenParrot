@@ -5,10 +5,62 @@
 
 static uint8_t g_fastIOValues[64];
 
+namespace
+{
+	volatile LONG enEinsFastIoCallCount = 0;
+
+	bool IsEnEinsFastIoDiagnosticsEnabled()
+	{
+		char value[8] = {};
+		const DWORD length = GetEnvironmentVariableA(
+			"TP_ENEINS_DIAGNOSTICS",
+			value,
+			_countof(value));
+		return length > 0 &&
+			length < _countof(value) &&
+			value[0] == '1';
+	}
+
+	void WriteEnEinsFastIoTrace(
+		const char* operation,
+		const DWORD commandCode,
+		const DWORD value,
+		const DWORD deviceResult)
+	{
+		if (!IsEnEinsFastIoDiagnosticsEnabled())
+			return;
+
+		const LONG call = InterlockedIncrement(&enEinsFastIoCallCount);
+		if (call > 256)
+			return;
+
+		char key[32] = {};
+		sprintf_s(key, "Call%ld", call);
+		char trace[192] = {};
+		sprintf_s(
+			trace,
+			"operation=%s command=%08X value=%08X deviceResult=%08X",
+			operation,
+			commandCode,
+			value,
+			deviceResult);
+		WritePrivateProfileStringA(
+			"FastIo",
+			key,
+			trace,
+			".\\EnEinsDiagnostic.ini");
+	}
+}
+
 DWORD __cdecl iDmacDrvOpen(int deviceId, LPVOID outBuffer, LPVOID lpSomeFlag)
 {
 	*(DWORD*)outBuffer = 284;
 	*(DWORD*)lpSomeFlag = 0;
+	WriteEnEinsFastIoTrace(
+		"Open",
+		static_cast<DWORD>(deviceId),
+		*(DWORD*)outBuffer,
+		*(DWORD*)lpSomeFlag);
 #ifdef LogFastIO
 	info(true, "iDmacDrvOpen(deviceId=%d, outBuffer='%08X', lpSomeFlag=%08X) -> result=%08X", deviceId, *(DWORD*)outBuffer, *(DWORD*)lpSomeFlag, 0);
 	info(true, "--------------------------------------------");
@@ -168,6 +220,11 @@ int __cdecl iDmacDrvRegisterRead(int DeviceId, DWORD CommandCode, LPVOID OutBuff
 	}
 	*(DWORD*)OutBuffer = result;
 	*(DWORD*)DeviceResult = 0;
+	WriteEnEinsFastIoTrace(
+		"Read",
+		CommandCode,
+		*(DWORD*)OutBuffer,
+		*(DWORD*)DeviceResult);
 #ifdef LogFastIO
 	info(true, "iDmacDrvRegisterRead(DeviceId=%d, CommandCode=%08X, OutBuffer=%08X, DeviceResult=%08X) -> result=%08X", DeviceId, CommandCode, *(DWORD*)OutBuffer, *(DWORD*)DeviceResult, 0);
 	info(true, "--------------------------------------------");
@@ -177,6 +234,13 @@ int __cdecl iDmacDrvRegisterRead(int DeviceId, DWORD CommandCode, LPVOID OutBuff
 
 int __cdecl iDmacDrvRegisterWrite(int deviceId, DWORD CommandCode, int unused, DWORD *DeviceResult)
 {
+	const DWORD originalDeviceResult =
+		DeviceResult == nullptr ? 0 : *DeviceResult;
+	WriteEnEinsFastIoTrace(
+		"WriteEnter",
+		CommandCode,
+		static_cast<DWORD>(unused),
+		originalDeviceResult);
 #ifdef LogFastIO
 	info(true, "iDmacDrvRegisterWrite(deviceId=%d, CommandCode='%08X', unused=%08X, DeviceResult=%08X) -> result=%08X", deviceId, CommandCode, unused, *(DWORD*)DeviceResult, 0);
 	info(true, "--------------------------------------------");

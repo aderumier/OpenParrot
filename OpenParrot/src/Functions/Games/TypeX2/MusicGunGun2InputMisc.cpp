@@ -3,6 +3,7 @@
 #include "Utility/InitFunction.h"
 #include "Functions/Global.h"
 #include "Utility/Helper.h"
+#include <d3d9.h>
 
 extern int* ffbOffset;
 extern int* ffbOffset2;
@@ -23,6 +24,51 @@ UINT8 MusicGunGun2Volume;
 
 static char VolPercentChar[256];
 static char INIChar[256];
+
+namespace
+{
+	HRESULT WINAPI MusicGunGun2CreateDeviceAndroidHook(
+		IDirect3D9* direct3D,
+		UINT adapter,
+		D3DDEVTYPE deviceType,
+		HWND focusWindow,
+		DWORD behaviorFlags,
+		D3DPRESENT_PARAMETERS* presentationParameters,
+		IDirect3DDevice9** returnedDevice)
+	{
+		if (direct3D == nullptr)
+			return E_POINTER;
+
+		// Keep a real call/return boundary here. In an optimized Release build a
+		// direct return is tail-call folded back into the game's original COM
+		// dispatch, which defeats the Android x86 bridge compatibility wrapper.
+		volatile HRESULT result = direct3D->CreateDevice(
+			adapter,
+			deviceType,
+			focusWindow,
+			behaviorFlags,
+			presentationParameters,
+			returnedDevice);
+		return result;
+	}
+}
+
+void InstallMusicGunGun2AndroidD3D9Compatibility()
+{
+	if (getenv("ANDROID_ALSA_SERVER") == nullptr)
+		return;
+
+	// Under the Android x86 bridge, the game's original inline COM dispatch can
+	// intermittently leave a black surface or exit even after the native
+	// 1360x768 fullscreen mode is available. Routing the same arguments through
+	// a normal stdcall boundary keeps the Wine/DXVK device setup deterministic.
+	// This replaces exactly: mov eax,[edx+40h] / call eax.
+	const auto base = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
+	injector::MakeCALL(
+		base + 0x11F3B,
+		MusicGunGun2CreateDeviceAndroidHook,
+		true);
+}
 
 HWND(WINAPI* MusicGunGun2CreateWindowExAOri)(DWORD dwExStyle, LPCSTR lpClassName, LPCSTR lpWindowName, DWORD dwStyle, int X, int Y, int nWidth, int nHeight, HWND hWndParent, HMENU hMenu, HINSTANCE hInstance, LPVOID lpParam);
 HWND WINAPI MusicGunGun2CreateWindowExAHook(DWORD dwExStyle, LPCSTR lpClassName, LPCSTR lpWindowName, DWORD dwStyle, int X, int Y, int nWidth, int nHeight, HWND hWndParent, HMENU hMenu, HINSTANCE hInstance, LPVOID lpParam)

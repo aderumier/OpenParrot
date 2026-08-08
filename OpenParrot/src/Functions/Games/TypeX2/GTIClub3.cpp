@@ -3,6 +3,75 @@
 #include "Functions/Global.h"
 #if _M_IX86
 DWORD mainModuleBase;
+
+static bool IsGtiClubDiagnosticsEnabled()
+{
+	char value[8] = {};
+	const DWORD length = GetEnvironmentVariableA(
+		"TP_ANDROID_DEBUG_LOGGING",
+		value,
+		_countof(value));
+	return length > 0 &&
+		length < _countof(value) &&
+		value[0] == '1';
+}
+
+static bool ShouldTolerateGtiClubRawSocketBindFailure()
+{
+	char androidAlsaServer[2] = {};
+	if (GetEnvironmentVariableA(
+		"ANDROID_ALSA_SERVER",
+		androidAlsaServer,
+		_countof(androidAlsaServer)) > 0)
+		return true;
+
+	// Host-only validation switch. The production Android path above does not
+	// depend on this variable, but keeping the override allows the exact same
+	// in-memory instruction to be exercised on Windows without changing the
+	// executable or its CRC.
+	char value[8] = {};
+	const DWORD length = GetEnvironmentVariableA(
+		"TP_GTI_TOLERATE_AVS_RAW_BIND_FAILURE",
+		value,
+		_countof(value));
+	return length > 0 &&
+		length < _countof(value) &&
+		value[0] == '1';
+}
+
+static int __cdecl GtiClubAvsLogCallback(
+	int,
+	const char* message,
+	int messageLength)
+{
+	if (!IsGtiClubDiagnosticsEnabled() ||
+		message == nullptr ||
+		messageLength <= 0)
+		return 0;
+
+	HANDLE logFile = CreateFileA(
+		".\\GTIClub3AvsDiagnostic.log",
+		FILE_APPEND_DATA,
+		FILE_SHARE_READ | FILE_SHARE_WRITE,
+		nullptr,
+		OPEN_ALWAYS,
+		FILE_ATTRIBUTE_NORMAL,
+		nullptr);
+	if (logFile != INVALID_HANDLE_VALUE)
+	{
+		DWORD bytesWritten = 0;
+		WriteFile(
+			logFile,
+			message,
+			static_cast<DWORD>(messageLength),
+			&bytesWritten,
+			nullptr);
+		CloseHandle(logFile);
+	}
+
+	return 0;
+}
+
 int __cdecl IgnoreFunc(int a1, int a2)
 {
 	int result; // eax
@@ -98,6 +167,44 @@ static InitFunction GtiClub3Func([]()
 {
 
 	mainModuleBase = (DWORD)GetModuleHandle(0);
+
+	// EA3's keepalive layer creates a raw AVS socket successfully under Wine on
+	// Android, but its bind returns 0x8007000D. The stock failure branch closes
+	// that valid socket and intentionally aborts. Disabling AVS raw networking is
+	// not safe: EA3 requests protocol ID 2 unconditionally and would instead
+	// abort on an unregistered protocol. Keep the initialized socket and let the
+	// title continue offline by skipping only the bind-failure cleanup branch.
+	// libavs-win32-ea3.dll is a static game import, so it is loaded before this
+	// title initializer. Validate the exact instruction bytes so other EA3 builds
+	// and unknown revisions remain untouched.
+	HMODULE ea3Module = GetModuleHandleA("libavs-win32-ea3.dll");
+	const BYTE expectedBindFailureBranch[] =
+		{ 0x0F, 0x8C, 0xE4, 0x04, 0x00, 0x00 };
+	BYTE* bindFailureBranch = ea3Module
+		? reinterpret_cast<BYTE*>(ea3Module) + 0x12958
+		: nullptr;
+	if (ShouldTolerateGtiClubRawSocketBindFailure() &&
+		bindFailureBranch != nullptr &&
+		memcmp(
+			bindFailureBranch,
+			expectedBindFailureBranch,
+			sizeof(expectedBindFailureBranch)) == 0)
+	{
+		injector::MakeNOP(
+			reinterpret_cast<DWORD>(bindFailureBranch),
+			sizeof(expectedBindFailureBranch),
+			true);
+	}
+
+	// The game's original AVS callback at this address discards every log
+	// message, including the fatal message immediately before AVS invokes its
+	// debugger-break abort handler. Preserve the production no-op behavior,
+	// but retain those exact messages when the per-game Android diagnostics
+	// toggle is enabled so Wine-only failures can be traced without guessing.
+	injector::MakeJMP(
+		mainModuleBase + 0x4DCB0,
+		GtiClubAvsLogCallback,
+		true);
 
 	DWORD funcPtr = (DWORD)(void *)IgnoreFunc;
 

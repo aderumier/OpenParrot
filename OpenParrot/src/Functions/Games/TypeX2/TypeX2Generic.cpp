@@ -3,6 +3,7 @@
 #include "Utility/GameDetect.h"
 #include "Utility/InitFunction.h"
 #include "Functions/Global.h"
+#include "Functions/FpsLimiter.h"
 #include "Utility/Helper.h"
 #include <float.h>
 #if _M_IX86
@@ -26,6 +27,18 @@ extern void GaiaAttack4Inputs(Helpers* helpers);
 static bool ProMode;
 extern bool BG4EnableTracks;
 bool FFBReportWheelPosition;
+
+static BOOL(WINAPI* TetrisSwapBuffersOriginal)(HDC) = nullptr;
+
+static BOOL WINAPI TetrisSwapBuffersAndroid(HDC deviceContext)
+{
+	// TGM3 renders through OpenGL/Zink. DXVK's D3D frame limiter therefore
+	// never sees its presents, and high-refresh Android displays run the
+	// frame-based game logic too quickly. Throttle only this title's imported
+	// SwapBuffers call; Windows and desktop Wine retain their native timing.
+	FpsLimiter();
+	return TetrisSwapBuffersOriginal(deviceContext);
+}
 
 static constexpr DWORD bg4FloatMultipleTraps = 0xC00002B5;
 static PVOID bg4FpuExceptionHandler = nullptr;
@@ -91,6 +104,118 @@ static LONG CALLBACK BG4FpuExceptionRecovery(
 		reinterpret_cast<DWORD*>(extendedRegisters + 24);
 	*savedMxCsr = (*savedMxCsr | 0x1F80) & ~0x3F;
 	return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+static DWORD bg4EnglishDsoundLoopReturn = 0;
+static volatile LONG bg4EnglishDsoundLoopPatchState = 0;
+
+static __declspec(naked) void BG4EnglishDsoundResampleLoopAndroid()
+{
+	__asm
+	{
+		// Wine's resampler deliberately permits a one-column buffer. Its x87
+		// path yields infinity/NaN with masked exceptions, but Box64 turns that
+		// degenerate divide into STATUS_FLOAT_MULTIPLE_TRAPS. Silence only that
+		// invalid sample; normal buffers retain the equivalent resampling math.
+		cmp dword ptr [ebp + 8], 1
+		jle write_silence
+
+		sub esp, 32
+		movups [esp], xmm0
+		movups [esp + 16], xmm1
+
+		movss xmm1, dword ptr [ebp - 14h]
+		cvtsi2ss xmm0, dword ptr [ebp + 0Ch]
+		addss xmm0, xmm1
+
+		cmp ecx, dword ptr [ebp - 8]
+		je use_reciprocal
+		movss xmm1, dword ptr [eax]
+
+	use_reciprocal:
+		mulss xmm1, dword ptr [ebp - 18h]
+		divss xmm1, xmm0
+		movss dword ptr [eax], xmm1
+
+		movups xmm0, [esp]
+		movups xmm1, [esp + 16]
+		add esp, 32
+		jmp advance_sample
+
+	write_silence:
+		mov dword ptr [eax], 0
+
+	advance_sample:
+		inc ecx
+		add eax, 4
+		push dword ptr [bg4EnglishDsoundLoopReturn]
+		ret
+	}
+}
+
+static bool InstallBG4EnglishDsoundLoopPatch()
+{
+	const LONG patchState = InterlockedCompareExchange(
+		&bg4EnglishDsoundLoopPatchState, 0, 0);
+	if (patchState != 0)
+		return patchState > 0;
+
+	HMODULE dsound = GetModuleHandleA("DSOUND.dll");
+	if (dsound == nullptr)
+		return false;
+
+	BYTE* const loopStart = reinterpret_cast<BYTE*>(dsound) + 0x476B5;
+	static const BYTE expected[] = { 0x3B, 0x4D, 0xF8, 0x75, 0x05 };
+	if (memcmp(loopStart, expected, sizeof(expected)) != 0)
+	{
+		TpInfo("BG4 Android: unsupported DSOUND resampler signature");
+		InterlockedExchange(&bg4EnglishDsoundLoopPatchState, -1);
+		return false;
+	}
+
+	bg4EnglishDsoundLoopReturn =
+		reinterpret_cast<DWORD>(dsound) + 0x476CC;
+	const intptr_t displacement =
+		reinterpret_cast<BYTE*>(&BG4EnglishDsoundResampleLoopAndroid) -
+		(loopStart + 5);
+
+	DWORD oldProtection = 0;
+	if (!VirtualProtect(
+			loopStart,
+			sizeof(expected),
+			PAGE_EXECUTE_READWRITE,
+			&oldProtection))
+		return false;
+
+	loopStart[0] = 0xE9;
+	*reinterpret_cast<int32_t*>(loopStart + 1) =
+		static_cast<int32_t>(displacement);
+	FlushInstructionCache(GetCurrentProcess(), loopStart, sizeof(expected));
+	DWORD ignoredProtection = 0;
+	VirtualProtect(
+		loopStart,
+		sizeof(expected),
+		oldProtection,
+		&ignoredProtection);
+	InterlockedExchange(&bg4EnglishDsoundLoopPatchState, 1);
+	TpInfo("BG4 Android: installed one-column DirectSound guard");
+	return true;
+}
+
+static DWORD WINAPI BG4EnglishDsoundPatchThread(LPVOID)
+{
+	for (unsigned int attempt = 0; attempt < 3000; ++attempt)
+	{
+		if (InstallBG4EnglishDsoundLoopPatch())
+			return 0;
+		if (InterlockedCompareExchange(
+				&bg4EnglishDsoundLoopPatchState, 0, 0) < 0)
+			return 1;
+		Sleep(10);
+	}
+
+	TpInfo("BG4 Android: DSOUND resampler did not load within 30 seconds");
+	return 2;
 }
 
 typedef HRESULT(WINAPI* ChaseDirectPlayHost_t)(
@@ -331,6 +456,7 @@ extern char* __cdecl MusicGunGun2strncpy(char* Destination, const char* Source, 
 extern HWND(WINAPI* MusicGunGun2CreateWindowExAOri)(DWORD dwExStyle, LPCSTR lpClassName, LPCSTR lpWindowName, DWORD dwStyle, int X, int Y, int nWidth, int nHeight, HWND hWndParent, HMENU hMenu, HINSTANCE hInstance, LPVOID lpParam);
 extern HWND WINAPI MusicGunGun2CreateWindowExAHook(DWORD dwExStyle, LPCSTR lpClassName, LPCSTR lpWindowName, DWORD dwStyle, int X, int Y, int nWidth, int nHeight, HWND hWndParent, HMENU hMenu, HINSTANCE hInstance, LPVOID lpParam);
 extern UINT8 MusicGunGun2Volume;
+extern void InstallMusicGunGun2AndroidD3D9Compatibility();
 
 // Haunted Museum
 extern HWND(WINAPI* HauntedMuseumCreateWindowExAOri)(DWORD dwExStyle, LPCSTR lpClassName, LPCSTR lpWindowName, DWORD dwStyle, int X, int Y, int nWidth, int nHeight, HWND hWndParent, HMENU hMenu, HINSTANCE hInstance, LPVOID lpParam);
@@ -1161,13 +1287,13 @@ static InitFunction initFunction([]()
 			}
 			else
 			{
-				// A clean 2.08 executable reaches the external transmission/server
-				// check after calibration and can remain on a black screen in a
-				// single-cabinet Winlator session.  Apply the same `mov eax,1`
-				// bypass carried by commonly distributed patched executables, but
-				// only in process memory.  This leaves the user's executable and CRC
-				// untouched, while desktop Windows/Linux retain the clean lookup and
-				// their normal LAN/pro-mode behavior.
+				// Tuned 2.08 uses this lookup while resolving its selected
+				// transmission entry. Retain the commonly distributed forced-index
+				// patch only in Android process memory, leaving the executable and
+				// CRC untouched. This is not a generic post-calibration black-screen
+				// bypass: original BG4 (`BG4_Eng`) has a different layout and no
+				// verified equivalent at this offset. Desktop Windows/Linux retain
+				// the clean Tuned lookup and their normal pro-mode behavior.
 				injector::WriteMemoryRaw(imageBase + 0xCBCB8, "\xB8\x01\x00\x00\x00\x90\x90\x90\x90\x90", 10, true);
 			}
 			// End of dirty executable patches
@@ -1242,6 +1368,24 @@ static InitFunction initFunction([]()
 		}
 		case X2Type::BG4_Eng:
 		{
+			if (getenv("ANDROID_ALSA_SERVER") != nullptr &&
+				InterlockedCompareExchange(
+					&bg4EnglishDsoundLoopPatchState, 0, 0) == 0)
+			{
+				// The Android runtime can load DirectSound after OpenParrot. Patch the
+				// verified in-memory resampler when it appears; the Wine DLL on disk,
+				// native Windows, desktop Wine, and every other game remain untouched.
+				HANDLE patchThread = CreateThread(
+					nullptr,
+					0,
+					BG4EnglishDsoundPatchThread,
+					nullptr,
+					0,
+					nullptr);
+				if (patchThread != nullptr)
+					CloseHandle(patchThread);
+			}
+
 			if (ToBool(config["General"]["IntroFix"]))
 			{
 				// thanks for Ducon2016 for the patch!
@@ -1441,6 +1585,14 @@ static InitFunction initFunction([]()
 	
 	if(GameDetect::currentGame == GameID::TetrisGM3)
 	{
+		if (getenv("ANDROID_ALSA_SERVER") != nullptr)
+		{
+			FpsLimiterSet(60.0f);
+			TetrisSwapBuffersOriginal = iatHook(
+				"gdi32.dll",
+				TetrisSwapBuffersAndroid,
+				"SwapBuffers");
+		}
 		// TODO: DOCUMENT PATCHES
 		injector::WriteMemory<DWORD>(0x0046A0AC, 0x00005C2E, true); //required to boot
 		// windowed mode patch (if set to windowed in config) Makes it a proper windowed app. Not the first person to have done this patch
@@ -1936,6 +2088,7 @@ static InitFunction initFunction([]()
 	if (GameDetect::currentGame == GameID::MusicGunGun2)
 	{
 		DWORD oldPageProtection = 0;
+		InstallMusicGunGun2AndroidD3D9Compatibility();
 		
 		if (ToBool(config["General"]["Windowed"]))
 		{

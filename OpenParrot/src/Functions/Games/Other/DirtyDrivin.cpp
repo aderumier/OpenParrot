@@ -50,9 +50,53 @@ static HANDLE DirtyVulcanLuxHandle = INVALID_HANDLE_VALUE;
 
 static decltype(&CreateFileA) DirtyCreateFileAOri = nullptr;
 static decltype(&CreateFileW) DirtyCreateFileWOri = nullptr;
+static decltype(&CreateWindowExW) DirtyCreateWindowExWOri = nullptr;
 static decltype(&socket) DirtySocketOri = nullptr;
+static volatile LONG DirtyCreateWindowExWCallCount = 0;
+using DirtyD3D9Reset = HRESULT(WINAPI*)(
+	IDirect3DDevice9*,
+	D3DPRESENT_PARAMETERS*);
+using DirtyD3D9CreateDevice = HRESULT(WINAPI*)(
+	IDirect3D9*,
+	UINT,
+	D3DDEVTYPE,
+	HWND,
+	DWORD,
+	D3DPRESENT_PARAMETERS*,
+	IDirect3DDevice9**);
+static DirtyD3D9Reset DirtyD3D9ResetOri = nullptr;
+static volatile LONG DirtyD3D9ResetCallCount = 0;
+static uintptr_t DirtyD3D9CreateDeviceAddress = 0;
 
 static bool IsDirtyDiagnosticsEnabled()
+{
+	static const bool enabled = []()
+	{
+		const char* variables[] = {
+			"TP_ANDROID_DEBUG_LOGGING",
+			"TP_DIRTY_LOCAL_DIAGNOSTICS"
+		};
+		for (const char* variable : variables)
+		{
+			char value[8] = {};
+			const DWORD length =
+				GetEnvironmentVariableA(
+					variable,
+					value,
+					_countof(value));
+			if (length > 0 &&
+				length < _countof(value) &&
+				value[0] == '1')
+			{
+				return true;
+			}
+		}
+		return false;
+	}();
+	return enabled;
+}
+
+static bool IsDirtyWindowApiDiagnosticsEnabled()
 {
 	static const bool enabled = []()
 	{
@@ -62,7 +106,9 @@ static bool IsDirtyDiagnosticsEnabled()
 				"TP_ANDROID_DEBUG_LOGGING",
 				value,
 				_countof(value));
-		return length > 0 && length < _countof(value) && value[0] == '1';
+		return length > 0 &&
+			length < _countof(value) &&
+			value[0] == '1';
 	}();
 	return enabled;
 }
@@ -81,6 +127,72 @@ static void DirtyOutputDebugString(const char* value)
 {
 	if (IsDirtyDiagnosticsEnabled())
 		OutputDebugStringA(value);
+}
+
+static HWND WINAPI DirtyCreateWindowExWHook(
+	const DWORD exStyle,
+	const LPCWSTR className,
+	const LPCWSTR windowName,
+	const DWORD style,
+	const int x,
+	const int y,
+	const int width,
+	const int height,
+	const HWND parent,
+	const HMENU menu,
+	const HINSTANCE instance,
+	const LPVOID parameters)
+{
+	const HWND result =
+		DirtyCreateWindowExWOri(
+			exStyle,
+			className,
+			windowName,
+			style,
+			x,
+			y,
+			width,
+			height,
+			parent,
+			menu,
+			instance,
+			parameters);
+	const DWORD error = GetLastError();
+	const LONG call = InterlockedIncrement(&DirtyCreateWindowExWCallCount);
+	char key[32] = {};
+	sprintf_s(key, "Call%ld", call);
+	char diagnostic[512] = {};
+	sprintf_s(
+		diagnostic,
+		"result=%08X error=%lu thread=%lu caller=%08X "
+		"class=%08X title=%08X exStyle=%08X style=%08X "
+		"x=%d y=%d width=%d height=%d parent=%08X parentValid=%u "
+		"menu=%08X instance=%08X parameters=%08X",
+		reinterpret_cast<uintptr_t>(result),
+		error,
+		GetCurrentThreadId(),
+		reinterpret_cast<uintptr_t>(_ReturnAddress()),
+		reinterpret_cast<uintptr_t>(className),
+		reinterpret_cast<uintptr_t>(windowName),
+		exStyle,
+		style,
+		x,
+		y,
+		width,
+		height,
+		reinterpret_cast<uintptr_t>(parent),
+		parent == nullptr ? 1 : (IsWindow(parent) ? 1 : 0),
+		reinterpret_cast<uintptr_t>(menu),
+		reinterpret_cast<uintptr_t>(instance),
+		reinterpret_cast<uintptr_t>(parameters));
+	WriteDirtyDiagnosticProfile(
+		"CreateWindowExW",
+		key,
+		diagnostic,
+		".\\DirtyDrivinWindowDiagnostic.ini");
+	DirtyOutputDebugString(diagnostic);
+	SetLastError(error);
+	return result;
 }
 
 static SOCKET WSAAPI DirtySocketHook(
@@ -445,10 +557,32 @@ static LONG CALLBACK DirtyExceptionDiagnostic(
 {
 	if (exceptionPointers == nullptr ||
 		exceptionPointers->ExceptionRecord == nullptr ||
-		exceptionPointers->ContextRecord == nullptr ||
-		exceptionPointers->ExceptionRecord->ExceptionCode !=
-			EXCEPTION_ACCESS_VIOLATION)
+		exceptionPointers->ContextRecord == nullptr)
 	{
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+
+	const DWORD exceptionCode =
+		exceptionPointers->ExceptionRecord->ExceptionCode;
+	switch (exceptionCode)
+	{
+	case EXCEPTION_ACCESS_VIOLATION:
+	case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:
+	case EXCEPTION_DATATYPE_MISALIGNMENT:
+	case EXCEPTION_FLT_DIVIDE_BY_ZERO:
+	case EXCEPTION_FLT_INVALID_OPERATION:
+	case EXCEPTION_FLT_OVERFLOW:
+	case EXCEPTION_FLT_UNDERFLOW:
+	case EXCEPTION_ILLEGAL_INSTRUCTION:
+	case EXCEPTION_INT_DIVIDE_BY_ZERO:
+	case EXCEPTION_INT_OVERFLOW:
+	case EXCEPTION_PRIV_INSTRUCTION:
+	case EXCEPTION_STACK_OVERFLOW:
+	case 0xC00002B4: // STATUS_FLOAT_MULTIPLE_FAULTS
+	case 0xC00002B5: // STATUS_FLOAT_MULTIPLE_TRAPS
+	case 0xC0000374: // STATUS_HEAP_CORRUPTION
+		break;
+	default:
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
 	if (InterlockedCompareExchange(&dirtyExceptionCaptured, 1, 0) != 0)
@@ -752,6 +886,138 @@ static void WriteDirtyStateDiagnostic(const char* key, const char* value)
 		".\\DirtyDrivinStateDiagnostic.ini");
 }
 
+static HRESULT WINAPI DirtyD3D9ResetHook(
+	IDirect3DDevice9* device,
+	D3DPRESENT_PARAMETERS* parameters)
+{
+	const LONG call = InterlockedIncrement(&DirtyD3D9ResetCallCount);
+	const DWORD width = parameters == nullptr ? 0 : parameters->BackBufferWidth;
+	const DWORD height = parameters == nullptr ? 0 : parameters->BackBufferHeight;
+	const BOOL windowed = parameters == nullptr ? FALSE : parameters->Windowed;
+	const HWND window = parameters == nullptr ? nullptr : parameters->hDeviceWindow;
+	const uintptr_t caller = reinterpret_cast<uintptr_t>(_ReturnAddress());
+	const BYTE currentGameState = *reinterpret_cast<const BYTE*>(0x00970190);
+	const HRESULT result = DirtyD3D9ResetOri(device, parameters);
+
+	if (IsDirtyDiagnosticsEnabled() && (call <= 64 || (call % 128) == 0))
+	{
+		char diagnostic[256] = {};
+		sprintf_s(
+			diagnostic,
+			"TP_DIRTY_DIAG d3d9-reset call=%ld width=%lu height=%lu "
+			"windowed=%u window=%08X caller=%08X state=%u result=%08X",
+			call,
+			width,
+			height,
+			windowed ? 1 : 0,
+			reinterpret_cast<uintptr_t>(window),
+			caller,
+			static_cast<unsigned int>(currentGameState),
+			static_cast<unsigned int>(result));
+		DirtyOutputDebugString(diagnostic);
+		WriteDirtyStateDiagnostic("D3D9Reset", diagnostic);
+	}
+	return result;
+}
+
+static bool InstallDirtyD3D9ResetHook(IDirect3DDevice9* device)
+{
+	if (!IsDirtyDrivinRunningUnderWine() || device == nullptr)
+		return false;
+
+	void** vtable = *reinterpret_cast<void***>(device);
+	if (vtable == nullptr)
+		return false;
+	constexpr size_t resetIndex = 16;
+	void** resetEntry = vtable + resetIndex;
+	void* const hook = reinterpret_cast<void*>(DirtyD3D9ResetHook);
+	if (*resetEntry == hook)
+		return true;
+
+	if (DirtyD3D9ResetOri == nullptr)
+		DirtyD3D9ResetOri = reinterpret_cast<DirtyD3D9Reset>(*resetEntry);
+	DWORD oldProtection = 0;
+	if (VirtualProtect(
+			resetEntry,
+			sizeof(*resetEntry),
+			PAGE_EXECUTE_READWRITE,
+			&oldProtection))
+	{
+		*resetEntry = hook;
+		FlushInstructionCache(GetCurrentProcess(), resetEntry, sizeof(*resetEntry));
+		DWORD ignored = 0;
+		VirtualProtect(
+			resetEntry,
+			sizeof(*resetEntry),
+			oldProtection,
+			&ignored);
+		DirtyOutputDebugString("TP_DIRTY_DIAG d3d9-reset-hooked");
+		WriteDirtyStateDiagnostic("D3D9ResetHook", "1");
+		return true;
+	}
+	return false;
+}
+
+static HRESULT WINAPI DirtyD3D9CreateDeviceHook(
+	IDirect3D9* direct3D,
+	UINT adapter,
+	D3DDEVTYPE deviceType,
+	HWND focusWindow,
+	DWORD behaviorFlags,
+	D3DPRESENT_PARAMETERS* parameters,
+	IDirect3DDevice9** returnedDevice)
+{
+	const auto original =
+		reinterpret_cast<DirtyD3D9CreateDevice>(
+			DirtyD3D9CreateDeviceAddress);
+	if (original == nullptr)
+		return D3DERR_INVALIDCALL;
+
+	const HRESULT result = original(
+		direct3D,
+		adapter,
+		deviceType,
+		focusWindow,
+		behaviorFlags,
+		parameters,
+		returnedDevice);
+	IDirect3DDevice9* const device =
+		returnedDevice == nullptr ? nullptr : *returnedDevice;
+	if (SUCCEEDED(result))
+		InstallDirtyD3D9ResetHook(device);
+
+	if (IsDirtyDiagnosticsEnabled())
+	{
+		char diagnostic[192] = {};
+		sprintf_s(
+			diagnostic,
+			"TP_DIRTY_DIAG d3d9-create-device result=%08X device=%08X "
+			"width=%lu height=%lu windowed=%u",
+			static_cast<unsigned int>(result),
+			reinterpret_cast<uintptr_t>(device),
+			parameters == nullptr ? 0 : parameters->BackBufferWidth,
+			parameters == nullptr ? 0 : parameters->BackBufferHeight,
+			parameters != nullptr && parameters->Windowed ? 1 : 0);
+		DirtyOutputDebugString(diagnostic);
+		WriteDirtyStateDiagnostic("D3D9CreateDevice", diagnostic);
+	}
+	return result;
+}
+
+static void EnsureDirtyD3D9ResetHook()
+{
+	if (!IsDirtyDrivinRunningUnderWine())
+		return;
+
+	const uintptr_t video = *reinterpret_cast<const DWORD*>(0x0087F9C8);
+	if (video == 0)
+		return;
+	IDirect3DDevice9* device =
+		reinterpret_cast<IDirect3DDevice9*>(
+			*reinterpret_cast<const DWORD*>(video + 8));
+	InstallDirtyD3D9ResetHook(device);
+}
+
 static void WriteDirtyExitDiagnostic(const char* api, UINT exitCode)
 {
 	void* frames[12] = {};
@@ -1045,6 +1311,15 @@ static HRESULT __fastcall DirtyInitialWindowCreateHook(
 				optionB,
 				window);
 		attempts++;
+	}
+	if (IsDirtyDrivinRunningUnderWine() && SUCCEEDED(result))
+	{
+		// CreateWindowExW returns before Wine's X11 driver has necessarily
+		// published the new HWND to the next renderer call. The diagnostic
+		// wrapper made this race disappear by delaying the return path while
+		// it wrote its record. Preserve that behavior explicitly without
+		// requiring game logging or changing the native Windows path.
+		Sleep(100);
 	}
 	const auto videoAfter =
 		*reinterpret_cast<const DWORD*>(0x0087F9C8);
@@ -1664,6 +1939,7 @@ DWORD WINAPI InputRT9(LPVOID lpParam)
 	while (true)
 	{
 		GameState = *(BYTE*)(0x570190 + BaseAddress9);
+		EnsureDirtyD3D9ResetHook();
 		if (GameState != DirtyLastLoggedGameState)
 		{
 			char diagnostic[64] = {};
@@ -1902,11 +2178,10 @@ DWORD WINAPI InputRT9(LPVOID lpParam)
 }
 
 D3DPRESENT_PARAMETERS* pPresentationParameters_RT9;
-uintptr_t d3dcall;
 void __stdcall D3D9CreateParamPatch()
 {
 #if _M_IX86
-	__asm mov d3dcall, edx
+	__asm mov DirtyD3D9CreateDeviceAddress, edx
 #endif
 	DirtyOutputDebugString("TP_DIRTY_DIAG d3d9-create");
 	WriteDirtyStateDiagnostic("D3D9Create", "1");
@@ -1916,10 +2191,24 @@ void __stdcall D3D9CreateParamPatch()
 	pPresentationParameters_RT9->Windowed = TRUE;
 	pPresentationParameters_RT9->FullScreen_RefreshRateInHz = 0;
 	pPresentationParameters_RT9->hDeviceWindow = NULL;
+	if (IsDirtyDrivinRunningUnderWine())
+	{
+		// DXVK accepts zero-sized windowed backbuffers, but this title uses
+		// the stored dimensions when building its attract/Bink render targets.
+		// Keep the native Windows behavior and give Wine the actual guest size.
+		pPresentationParameters_RT9->BackBufferWidth = 1280;
+		pPresentationParameters_RT9->BackBufferHeight = 720;
+	}
 	injector::WriteMemoryRaw(0x63B332, "\xFF\xD2\x3D\x68\x08", 5, true);
 	__asm mov edx, pPresentationParameters_RT9
 	__asm mov[ebp + 0x1c], edx
-	__asm mov edx, d3dcall
+	uintptr_t createDeviceTarget = DirtyD3D9CreateDeviceAddress;
+	if (IsDirtyDrivinRunningUnderWine())
+	{
+		createDeviceTarget =
+			reinterpret_cast<uintptr_t>(DirtyD3D9CreateDeviceHook);
+	}
+	__asm mov edx, createDeviceTarget
 #endif
 	return;
 }
@@ -2002,6 +2291,14 @@ static InitFunction DirtyDrivinFunc([]()
 			{
 				DirtySocketOri =
 					iatHook("ws2_32.dll", DirtySocketHook, 23);
+				if (IsDirtyWindowApiDiagnosticsEnabled())
+				{
+					DirtyCreateWindowExWOri =
+						iatHook(
+							"user32.dll",
+							DirtyCreateWindowExWHook,
+							"CreateWindowExW");
+				}
 			}
 		}
 

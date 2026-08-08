@@ -126,6 +126,26 @@ LSTATUS __stdcall RegCreateKeyExWGlobalWrap(
 	LPDWORD                     lpdwDisposition
 )
 {
+	if (GameDetect::currentGame == GameID::GHA &&
+		hKey == HKEY_LOCAL_MACHINE &&
+		lpSubKey != nullptr &&
+		_wcsicmp(lpSubKey, L"SOFTWARE\\Aspyr\\Guitar Hero III") == 0)
+	{
+		// AWL first opens and then tries to create the same machine key.
+		// Wine correctly rejects a normal-user HKLM write, so mirror the
+		// open hook and back this GHA-only key with the per-user registry.
+		// Call the original export directly to avoid re-entering this hook.
+		return orig_RegCreateKeyExW(
+			HKEY_CURRENT_USER,
+			lpSubKey,
+			Reserved,
+			lpClass,
+			dwOptions,
+			samDesired,
+			lpSecurityAttributes,
+			phkResult,
+			lpdwDisposition);
+	}
 	return orig_RegCreateKeyExW(hKey, lpSubKey, Reserved, lpClass, dwOptions, samDesired, lpSecurityAttributes, phkResult, lpdwDisposition);
 }
 

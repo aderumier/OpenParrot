@@ -1,11 +1,11 @@
-﻿#if __has_include(<atlstr.h>)
-#include <StdInc.h>
+﻿#include <StdInc.h>
 #include "Utility/InitFunction.h"
 #include "Functions/Global.h"
 #include "Functions/GlobalRegHooks.h"
 #include "Utility\Hooking.Patterns.h"
-#include <atlstr.h>
 #include <windows.h>
+#include <gameux.h>
+#include <cstdarg>
 #include <string>
 #include <iostream>
 #include <shlobj.h>
@@ -32,6 +32,339 @@ BOOL(__stdcall *original_CreateWindowExA6)(DWORD dwExStyle, LPCSTR lpClassName, 
 BOOL(__stdcall *original_DefWindowProcA6)(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam);
 BOOL(__stdcall *original_SetCursorPosRT6)(int X, int Y);
 BOOL(__stdcall *original_SetWindowTextWRT6)(HWND hWnd, LPCWSTR lpString);
+HRESULT(WINAPI *original_CoCreateInstanceGHA)(
+	REFCLSID rclsid,
+	LPUNKNOWN pUnkOuter,
+	DWORD dwClsContext,
+	REFIID riid,
+	LPVOID* ppv);
+HRESULT(STDMETHODCALLTYPE *original_GameExplorerVerifyAccessGHA)(
+	IGameExplorer* self,
+	BSTR gdfBinaryPath,
+	BOOL* hasAccess);
+static HRESULT WINAPI CoCreateInstanceGHA(
+	REFCLSID rclsid,
+	LPUNKNOWN pUnkOuter,
+	DWORD dwClsContext,
+	REFIID riid,
+	LPVOID* ppv);
+
+static bool IsGHARegistryDiagnosticsEnabled()
+{
+	const char* variables[] = {
+		"TP_ANDROID_DEBUG_LOGGING",
+		"TP_GHA_LOCAL_DIAGNOSTICS"
+	};
+	for (const char* variable : variables)
+	{
+		char value[8] = {};
+		const DWORD length = GetEnvironmentVariableA(
+			variable,
+			value,
+			_countof(value));
+		if (length > 0 &&
+			length < _countof(value) &&
+			value[0] == '1')
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+static void LogGHARegistryDiagnostic(const char* format, ...)
+{
+	if (!IsGHARegistryDiagnosticsEnabled())
+		return;
+
+	char line[1024] = {};
+	va_list arguments;
+	va_start(arguments, format);
+	const int length = vsnprintf_s(
+		line,
+		sizeof(line),
+		_TRUNCATE,
+		format,
+		arguments);
+	va_end(arguments);
+	if (length <= 0)
+		return;
+
+	HANDLE file = CreateFileA(
+		"OpenParrotGHARegistry.log",
+		FILE_APPEND_DATA,
+		FILE_SHARE_READ | FILE_SHARE_WRITE,
+		nullptr,
+		OPEN_ALWAYS,
+		FILE_ATTRIBUTE_NORMAL,
+		nullptr);
+	if (file == INVALID_HANDLE_VALUE)
+		return;
+	DWORD written = 0;
+	WriteFile(file, line, static_cast<DWORD>(length), &written, nullptr);
+	WriteFile(file, "\r\n", 2, &written, nullptr);
+	CloseHandle(file);
+}
+
+static std::string GHARegistryText(LPCWSTR value)
+{
+	if (value == nullptr)
+		return "<null>";
+	const int required = WideCharToMultiByte(
+		CP_UTF8, 0, value, -1, nullptr, 0, nullptr, nullptr);
+	if (required <= 1)
+		return std::string();
+	std::string result(static_cast<size_t>(required), '\0');
+	WideCharToMultiByte(
+		CP_UTF8,
+		0,
+		value,
+		-1,
+		result.data(),
+		required,
+		nullptr,
+		nullptr);
+	result.pop_back();
+	return result;
+}
+
+static LSTATUS __stdcall RegOpenKeyExWGHA(
+	HKEY hKey,
+	LPCWSTR lpSubKey,
+	DWORD ulOptions,
+	REGSAM samDesired,
+	PHKEY phkResult)
+{
+	const LSTATUS result = RegOpenKeyExWGlobalWrap(
+		hKey, lpSubKey, ulOptions, samDesired, phkResult);
+	LogGHARegistryDiagnostic(
+		"RegOpenKeyExW root=%p key=%s result=%ld handle=%p",
+		hKey,
+		GHARegistryText(lpSubKey).c_str(),
+		result,
+		phkResult != nullptr ? *phkResult : nullptr);
+	return result;
+}
+
+static LSTATUS __stdcall RegCreateKeyExWGHA(
+	HKEY hKey,
+	LPCWSTR lpSubKey,
+	DWORD Reserved,
+	LPWSTR lpClass,
+	DWORD dwOptions,
+	REGSAM samDesired,
+	CONST LPSECURITY_ATTRIBUTES lpSecurityAttributes,
+	PHKEY phkResult,
+	LPDWORD lpdwDisposition)
+{
+	const LSTATUS result = RegCreateKeyExWGlobalWrap(
+		hKey,
+		lpSubKey,
+		Reserved,
+		lpClass,
+		dwOptions,
+		samDesired,
+		lpSecurityAttributes,
+		phkResult,
+		lpdwDisposition);
+	LogGHARegistryDiagnostic(
+		"RegCreateKeyExW root=%p key=%s result=%ld handle=%p disposition=%lu",
+		hKey,
+		GHARegistryText(lpSubKey).c_str(),
+		result,
+		phkResult != nullptr ? *phkResult : nullptr,
+		lpdwDisposition != nullptr ? *lpdwDisposition : 0);
+	return result;
+}
+
+static LSTATUS __stdcall RegQueryValueExWGHA(
+	HKEY hKey,
+	LPCWSTR lpValueName,
+	LPDWORD lpReserved,
+	LPDWORD lpType,
+	__out_data_source(REGISTRY) LPBYTE lpData,
+	LPDWORD lpcbData)
+{
+	const LSTATUS result = RegQueryValueExWGlobalWrap(
+		hKey, lpValueName, lpReserved, lpType, lpData, lpcbData);
+	LogGHARegistryDiagnostic(
+		"RegQueryValueExW handle=%p value=%s result=%ld type=%lu size=%lu",
+		hKey,
+		GHARegistryText(lpValueName).c_str(),
+		result,
+		lpType != nullptr ? *lpType : 0,
+		lpcbData != nullptr ? *lpcbData : 0);
+	if (result == ERROR_SUCCESS &&
+		lpType != nullptr &&
+		(*lpType == REG_SZ || *lpType == REG_EXPAND_SZ) &&
+		lpData != nullptr &&
+		lpcbData != nullptr &&
+		*lpcbData >= sizeof(wchar_t))
+	{
+		LogGHARegistryDiagnostic(
+			"RegQueryValueExW value=%s text=%s",
+			GHARegistryText(lpValueName).c_str(),
+			GHARegistryText(
+				reinterpret_cast<LPCWSTR>(lpData)).c_str());
+	}
+	return result;
+}
+
+template<typename T>
+static bool HookImportedFunctionGHA(
+	HMODULE module,
+	const char* importedModule,
+	const char* importedFunction,
+	T replacement,
+	T* original = nullptr)
+{
+	if (module == nullptr)
+		return false;
+
+	auto* base = reinterpret_cast<unsigned char*>(module);
+	auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+	if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+		return false;
+	auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+	if (nt->Signature != IMAGE_NT_SIGNATURE)
+		return false;
+
+	const DWORD importRva =
+		nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
+	if (importRva == 0)
+		return false;
+
+	auto* descriptor = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + importRva);
+	for (; descriptor->Name != 0; ++descriptor)
+	{
+		const char* moduleName =
+			reinterpret_cast<const char*>(base + descriptor->Name);
+		if (_stricmp(moduleName, importedModule) != 0)
+			continue;
+		if (descriptor->OriginalFirstThunk == 0)
+			return false;
+
+		auto* nameThunk = reinterpret_cast<IMAGE_THUNK_DATA*>(
+			base + descriptor->OriginalFirstThunk);
+		auto* addressThunk = reinterpret_cast<IMAGE_THUNK_DATA*>(
+			base + descriptor->FirstThunk);
+		for (; nameThunk->u1.AddressOfData != 0; ++nameThunk, ++addressThunk)
+		{
+			if (IMAGE_SNAP_BY_ORDINAL(nameThunk->u1.Ordinal))
+				continue;
+			auto* import = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(
+				base + nameThunk->u1.AddressOfData);
+			if (_stricmp(
+					reinterpret_cast<const char*>(import->Name),
+					importedFunction) != 0)
+				continue;
+
+			if (original != nullptr)
+				*original = reinterpret_cast<T>(addressThunk->u1.Function);
+			injector::WriteMemory(
+				&addressThunk->u1.Function,
+				reinterpret_cast<uintptr_t>(replacement),
+				true);
+			return true;
+		}
+		return false;
+	}
+	return false;
+}
+
+static bool InstallGHARegistryIatHooks()
+{
+	HMODULE awlModule = GetModuleHandleA("AWL.dll");
+	if (awlModule == nullptr)
+		return false;
+
+	const bool openHooked = HookImportedFunctionGHA(
+		awlModule,
+		"advapi32.dll",
+		"RegOpenKeyExW",
+		&RegOpenKeyExWGHA);
+	const bool createHooked = HookImportedFunctionGHA(
+		awlModule,
+		"advapi32.dll",
+		"RegCreateKeyExW",
+		&RegCreateKeyExWGHA);
+	const bool queryHooked = HookImportedFunctionGHA(
+		awlModule,
+		"advapi32.dll",
+		"RegQueryValueExW",
+		&RegQueryValueExWGHA);
+	const bool coCreateHooked = HookImportedFunctionGHA(
+		awlModule,
+		"ole32.dll",
+		"CoCreateInstance",
+		&CoCreateInstanceGHA,
+		&original_CoCreateInstanceGHA);
+	LogGHARegistryDiagnostic(
+		"AWL=%p hooks open=%d create=%d query=%d coCreate=%d",
+		awlModule,
+		openHooked ? 1 : 0,
+		createHooked ? 1 : 0,
+		queryHooked ? 1 : 0,
+		coCreateHooked ? 1 : 0);
+	return openHooked && createHooked && queryHooked && coCreateHooked;
+}
+
+static DWORD WINAPI InstallGHADeferredIatHooks(LPVOID)
+{
+	// A CREATE_SUSPENDED Wine process can receive OpenParrot before the
+	// executable's static dependencies have been mapped. Patch AWL as soon as
+	// the loader exposes it, before the game's first registry validation.
+	for (int attempt = 0; attempt < 10000; ++attempt)
+	{
+		if (InstallGHARegistryIatHooks())
+			return 0;
+		Sleep(1);
+	}
+	LogGHARegistryDiagnostic("AWL registry imports were not available after 10s");
+	return ERROR_MOD_NOT_FOUND;
+}
+
+static HRESULT STDMETHODCALLTYPE GameExplorerVerifyAccessGHA(
+	IGameExplorer* self,
+	BSTR gdfBinaryPath,
+	BOOL* hasAccess)
+{
+	if (hasAccess != nullptr)
+		*hasAccess = TRUE;
+	return S_OK;
+}
+
+static HRESULT WINAPI CoCreateInstanceGHA(
+	REFCLSID rclsid,
+	LPUNKNOWN pUnkOuter,
+	DWORD dwClsContext,
+	REFIID riid,
+	LPVOID* ppv)
+{
+	const HRESULT result = original_CoCreateInstanceGHA(
+		rclsid,
+		pUnkOuter,
+		dwClsContext,
+		riid,
+		ppv);
+
+	if (SUCCEEDED(result) &&
+		ppv != nullptr &&
+		*ppv != nullptr &&
+		IsEqualIID(riid, __uuidof(IGameExplorer)))
+	{
+		auto* gameExplorer = static_cast<IGameExplorer*>(*ppv);
+		void* verifyAccess = (*reinterpret_cast<void***>(gameExplorer))[6];
+		const MH_STATUS hookResult = MH_CreateHook(
+			verifyAccess,
+			&GameExplorerVerifyAccessGHA,
+			reinterpret_cast<void**>(&original_GameExplorerVerifyAccessGHA));
+		if (hookResult == MH_OK || hookResult == MH_ERROR_ALREADY_CREATED)
+			MH_EnableHook(verifyAccess);
+	}
+
+	return result;
+}
 
 DWORD WINAPI WindowRT6(LPVOID lpParam)
 {
@@ -448,9 +781,10 @@ void GHAInputs(Helpers* helpers)
 
 static DWORD WINAPI RunningLoop(LPVOID lpParam)
 {
+	Helpers helpers;
 	while (true)
 	{
-		GHAInputs(0);
+		GHAInputs(&helpers);
 		Sleep(16);
 	}
 }
@@ -512,14 +846,48 @@ DWORD WINAPI SetWindowPosRT6(HWND hWnd, HWND hWndInsertAfter, int X, int Y, int 
 
 DWORD WINAPI SetWindowTextWRT6(HWND hWnd, LPCWSTR lpString)
 {
-	return original_SetWindowTextWRT6(hWnd, CStringW("Guitar Hero Arcade"));
+	return original_SetWindowTextWRT6(hWnd, L"Guitar Hero Arcade");
 }
 
 static InitFunction GHAFunc([]()
 {
+	char diagnosticWorkingDirectory[MAX_PATH + 1] = {};
+	GetCurrentDirectoryA(
+		static_cast<DWORD>(std::size(diagnosticWorkingDirectory)),
+		diagnosticWorkingDirectory);
+	LogGHARegistryDiagnostic(
+		"GHAFunc entered currentDirectory=%s image=%p",
+		diagnosticWorkingDirectory,
+		GetModuleHandleA(nullptr));
+
 	imageBase = (uintptr_t)GetModuleHandleA(0);
 
 	init_GlobalRegHooks();
+	// AWL.dll owns the Aspyr registry checks. Wine's experimental WOW64 path
+	// can bypass the advapi32 export hooks, just as it can bypass ole32 below,
+	// so bind AWL's three relevant imports directly to the existing GHA-aware
+	// wrappers. This remains title-local and leaves every other game's IAT
+	// untouched.
+	if (!InstallGHARegistryIatHooks())
+		CreateThread(nullptr, 0, InstallGHADeferredIatHooks, nullptr, 0, nullptr);
+	// Wine's experimental WOW64 path can bypass MinHook's ole32 export
+	// trampoline while still calling the executable's imported function.
+	// Bind the game's IAT directly so the access check is intercepted before
+	// the original call can terminate GHA.
+	if (original_CoCreateInstanceGHA == nullptr)
+	{
+		original_CoCreateInstanceGHA =
+			iatHook("ole32.dll", CoCreateInstanceGHA, "CoCreateInstance");
+	}
+	if (original_CoCreateInstanceGHA == nullptr)
+	{
+		MH_CreateHookApi(
+			L"ole32.dll",
+			"CoCreateInstance",
+			&CoCreateInstanceGHA,
+			reinterpret_cast<void**>(&original_CoCreateInstanceGHA));
+	}
+	MH_EnableHook(MH_ALL_HOOKS);
 	GetDesktopResolution(horizontal6, vertical6);
 
 	// Disable Xinput Inputs
@@ -627,4 +995,3 @@ static InitFunction GHAFunc([]()
 	CreateThread(NULL, 0, RunningLoop, NULL, 0, NULL);
 
 }, GameID::GHA);
-#endif
