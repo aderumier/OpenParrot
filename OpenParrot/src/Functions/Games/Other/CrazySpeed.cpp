@@ -9,7 +9,6 @@
 #include <float.h>
 #include <winscard.h>
 #include "CrazySpeed.h"
-#include "Utility/WineCompat.h"
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "Utility/stb_image_write.h"
 
@@ -1184,10 +1183,6 @@ static InitFunction CrazySpeedFunc([]()
 		HMODULE dongleDll = LoadLibraryA("dic32u.dll");
 		//HMODULE cgDll = LoadLibraryA("cg.dll");
 		bool useCustomRes = ToBool(config["Graphics"]["Use Custom Resolution"]);
-		// The stubbed WinSCard/wbemprox entry points below are Wine limitations
-		// on every host. The x87 recovery handler is a Box64 artifact, so it
-		// stays behind the explicit opt-in variable.
-		const bool useWineCompatibility = IsWineCompatEnabled();
 		const bool useAndroidCompatibility =
 			GetEnvironmentVariableA("TP_CRAZY_SPEED_FAKE_MEMORY_WMI", nullptr, 0) != 0;
 
@@ -1196,7 +1191,7 @@ static InitFunction CrazySpeedFunc([]()
 			crazySpeedFpuExceptionHandler =
 				AddVectoredExceptionHandler(1, CrazySpeedFpuExceptionRecovery);
 			if (!crazySpeedFpuExceptionHandler)
-				TpInfo("Crazy Speed: x87 exception recovery registration failed");
+				TpInfo("Crazy Speed Android: x87 exception recovery registration failed");
 		}
 
 		CardDataManager::LoadCardFromFile();
@@ -1263,7 +1258,7 @@ static InitFunction CrazySpeedFunc([]()
 		iatHook("kernel32.dll", GetCommModemStatusWrap, "GetCommModemStatus");
 		iatHook("kernel32.dll", CloseHandleWrap, "CloseHandle");
 
-		if (useWineCompatibility)
+		if (useAndroidCompatibility)
 		{
 			// Wine's WinSCard stubs do not implement the full API and can return
 			// success without a valid MULTI_SZ reader list. MinHook's API hooks
@@ -1290,14 +1285,14 @@ static InitFunction CrazySpeedFunc([]()
 		injector::MakeNOP(0x53d665, 0x17, true);
 		injector::WriteMemory<BYTE>(0x53d67c, 0xEB, true);
 
-		if (useWineCompatibility)
+		if (useAndroidCompatibility)
 		{
 			// Wine's wbemprox returns an empty enumeration for the obsolete
 			// Win32_LogicalMemoryConfiguration class. The original game assumes
 			// Next() returned an object and dereferences null at 0x502C18.
 			// Replace only that legacy inventory routine with a deterministic
-			// 8 GiB result under Wine; native Windows retains the original WMI
-			// path unless the compatibility flag is explicitly set.
+			// 8 GiB result for Android; native Windows/Linux launches retain the
+			// original WMI path unless the compatibility flag is explicitly set.
 			BYTE fakeMemoryWmi[] = {
 				0xC7, 0x47, 0x68, 0x00, 0x20, 0x00, 0x00, // mov [edi+68h], 8192
 				0xC3                                      // ret
