@@ -2,9 +2,10 @@ name: Build (Windows)
 
 on:
   push:
-    branches: [ "test", "test2", "master" ]
+    branches: [ "test", "test2", "master", "force-wine" ]
   pull_request:
     branches: [ "test", "test2", "master" ]
+  workflow_dispatch:
 
 jobs:
   build:
