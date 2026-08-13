@@ -368,6 +368,23 @@ static void __declspec(naked) JusticeLeagueLuaArrayGuard()
 	}
 }
 
+// Resolve a single pattern match, or nullptr when the module does not contain
+// it. These guards now install on desktop Wine too, so a build of the module
+// that does not match must skip the guard rather than dereference an empty
+// match list: hook::pattern only asserts on a miss, which is a no-op in a
+// Release build.
+template<size_t Len>
+static DWORD* FindJusticeLeagueGuardSite(
+	HMODULE module,
+	const char (&signature)[Len],
+	ptrdiff_t offset = 0)
+{
+	auto matches = hook::module_pattern(module, signature).count_hint(1);
+	if (matches.size() != 1)
+		return nullptr;
+	return matches.get_first<DWORD>(offset);
+}
+
 static DWORD WINAPI InstallJusticeLeagueAspectGuard(LPVOID)
 {
 	HMODULE renderer = nullptr;
@@ -399,71 +416,82 @@ static DWORD WINAPI InstallJusticeLeagueAspectGuard(LPVOID)
 		}
 	}
 
-	auto guardSite = hook::module_pattern(
+	auto guardSite = FindJusticeLeagueGuardSite(
 		renderer,
 		"8B 8E 7C 01 00 00 8B 11 8D 44 24 1C 50 8D 44 24 1C 50 "
-		"FF 92 90 00 00 00 DB 44 24 18 8B 4E 6C 8B 56 68 DA 74 24 1C")
-		.get_first<DWORD>(24);
-	justiceLeagueAspectGuardReturn =
-		reinterpret_cast<DWORD>(guardSite) + 7;
-	injector::MakeJMP(guardSite, JusticeLeagueAspectGuard, true);
-	injector::MakeNOP(reinterpret_cast<DWORD>(guardSite) + 5, 2);
+		"FF 92 90 00 00 00 DB 44 24 18 8B 4E 6C 8B 56 68 DA 74 24 1C",
+		24);
+	if (guardSite != nullptr)
+	{
+		justiceLeagueAspectGuardReturn =
+			reinterpret_cast<DWORD>(guardSite) + 7;
+		injector::MakeJMP(guardSite, JusticeLeagueAspectGuard, true);
+		injector::MakeNOP(reinterpret_cast<DWORD>(guardSite) + 5, 2);
+	}
 
-	auto projectionGuardSite = hook::module_pattern(
+	auto projectionGuardSite = FindJusticeLeagueGuardSite(
 		renderer,
-		"DB 44 24 14 DA 74 24 18 DE F9 D9 E8 D9 F3 DC C0")
-		.get_first<DWORD>();
-	justiceLeagueProjectionGuardReturn =
-		reinterpret_cast<DWORD>(projectionGuardSite) + 8;
-	injector::MakeJMP(
-		projectionGuardSite,
-		JusticeLeagueProjectionGuard,
-		true);
-	injector::MakeNOP(
-		reinterpret_cast<DWORD>(projectionGuardSite) + 5,
-		3);
+		"DB 44 24 14 DA 74 24 18 DE F9 D9 E8 D9 F3 DC C0");
+	if (projectionGuardSite != nullptr)
+	{
+		justiceLeagueProjectionGuardReturn =
+			reinterpret_cast<DWORD>(projectionGuardSite) + 8;
+		injector::MakeJMP(
+			projectionGuardSite,
+			JusticeLeagueProjectionGuard,
+			true);
+		injector::MakeNOP(
+			reinterpret_cast<DWORD>(projectionGuardSite) + 5,
+			3);
+	}
 
 	HMODULE lua = GetModuleHandleA("toluaxx.dll");
 	if (lua != nullptr)
 	{
-		auto luaCompactGuardSite = hook::module_pattern(
+		auto luaCompactGuardSite = FindJusticeLeagueGuardSite(
 			lua,
-			"DD 44 24 08 DB 5C 24 04 DB 44 24 04 DD 44 24 08 DA E9")
-			.get_first<DWORD>();
-		justiceLeagueLuaCompactGuardReturn =
-			reinterpret_cast<DWORD>(luaCompactGuardSite) + 0x19;
-		justiceLeagueLuaCompactGuardInvalid =
-			reinterpret_cast<DWORD>(luaCompactGuardSite) + 0x2E;
-		injector::MakeJMP(
-			luaCompactGuardSite,
-			JusticeLeagueLuaCompactGuard,
-			true);
+			"DD 44 24 08 DB 5C 24 04 DB 44 24 04 DD 44 24 08 DA E9");
+		if (luaCompactGuardSite != nullptr)
+		{
+			justiceLeagueLuaCompactGuardReturn =
+				reinterpret_cast<DWORD>(luaCompactGuardSite) + 0x19;
+			justiceLeagueLuaCompactGuardInvalid =
+				reinterpret_cast<DWORD>(luaCompactGuardSite) + 0x2E;
+			injector::MakeJMP(
+				luaCompactGuardSite,
+				JusticeLeagueLuaCompactGuard,
+				true);
+		}
 
-		auto luaIndexGuardSite = hook::module_pattern(
+		auto luaIndexGuardSite = FindJusticeLeagueGuardSite(
 			lua,
-			"DD 44 24 18 DB 5C 24 10 DB 44 24 10 DD 44 24 18 DA E9")
-			.get_first<DWORD>();
-		justiceLeagueLuaIndexGuardReturn =
-			reinterpret_cast<DWORD>(luaIndexGuardSite) + 0x19;
-		justiceLeagueLuaIndexGuardInvalid =
-			reinterpret_cast<DWORD>(luaIndexGuardSite) + 0x45;
-		injector::MakeJMP(
-			luaIndexGuardSite,
-			JusticeLeagueLuaIndexGuard,
-			true);
+			"DD 44 24 18 DB 5C 24 10 DB 44 24 10 DD 44 24 18 DA E9");
+		if (luaIndexGuardSite != nullptr)
+		{
+			justiceLeagueLuaIndexGuardReturn =
+				reinterpret_cast<DWORD>(luaIndexGuardSite) + 0x19;
+			justiceLeagueLuaIndexGuardInvalid =
+				reinterpret_cast<DWORD>(luaIndexGuardSite) + 0x45;
+			injector::MakeJMP(
+				luaIndexGuardSite,
+				JusticeLeagueLuaIndexGuard,
+				true);
+		}
 
-		auto luaIntegerGuardSite = hook::module_pattern(
+		auto luaIntegerGuardSite = FindJusticeLeagueGuardSite(
 			lua,
-			"DD 44 24 04 DB 5C 24 14 DB 44 24 14 DD 07 DA E9")
-			.get_first<DWORD>();
-		justiceLeagueLuaIntegerGuardReturn =
-			reinterpret_cast<DWORD>(luaIntegerGuardSite) + 0x17;
-		justiceLeagueLuaIntegerGuardInvalid =
-			reinterpret_cast<DWORD>(luaIntegerGuardSite) + 0x28;
-		injector::MakeJMP(
-			luaIntegerGuardSite,
-			JusticeLeagueLuaIntegerGuard,
-			true);
+			"DD 44 24 04 DB 5C 24 14 DB 44 24 14 DD 07 DA E9");
+		if (luaIntegerGuardSite != nullptr)
+		{
+			justiceLeagueLuaIntegerGuardReturn =
+				reinterpret_cast<DWORD>(luaIntegerGuardSite) + 0x17;
+			justiceLeagueLuaIntegerGuardInvalid =
+				reinterpret_cast<DWORD>(luaIntegerGuardSite) + 0x28;
+			injector::MakeJMP(
+				luaIntegerGuardSite,
+				JusticeLeagueLuaIntegerGuard,
+				true);
+		}
 
 		auto luaArrayGuardSite = hook::module_pattern(
 			lua,
