@@ -12,6 +12,7 @@
 
 #include <fcntl.h>
 #include <io.h>
+#include <wchar.h>
 #include <Shlwapi.h>
 
 #pragma comment(lib, "ntdll.lib")
@@ -30,12 +31,30 @@ char* LoaderExe = "OpenParrotLoader.exe";
 char* LoaderExe = "OpenParrotLoader64.exe";
 #endif
 
+// TeknoParrotUI forces TP_REMOTETHREAD=1 on every Wine/Proton launch: the
+// default thread-context hijack (Get/SetThreadContext run-to-address) corrupts
+// MXCSR in wow64 threads, which unmasks SSE exceptions and kills the game with
+// STATUS_FLOAT_MULTIPLE_TRAPS (0xC00002B5) on the first inexact float operation
+// in DllMain. Remote-thread injection never touches the main thread context, so
+// adopt it as the default under Wine and behave the same whether or not the
+// launch came through the UI.
+//
+// The variable is still honoured when set: 0/false/off restores the original
+// entry-point injection, and any other value enables remote-thread injection,
+// including on native Windows.
 static bool ShouldUseRemoteThread()
 {
 	wchar_t envVar[256] = { 0 };
 	DWORD result = GetEnvironmentVariable(
 		L"TP_REMOTETHREAD", envVar, static_cast<DWORD>(std::size(envVar)));
-	return (result > 0);
+	if (result == 0)
+		return IsRunningUnderWine();
+	if (result >= std::size(envVar))
+		return true;
+
+	return _wcsicmp(envVar, L"0") != 0 &&
+		_wcsicmp(envVar, L"false") != 0 &&
+		_wcsicmp(envVar, L"off") != 0;
 }
 
 static DWORD PostStartRemoteThreadDelay()
