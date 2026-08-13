@@ -199,6 +199,23 @@ LABEL_9:
 	return bResult;
 }
 
+// These titles expect the imported content key as a PLAINTEXTKEYBLOB encrypted
+// directly with the client's RSA public key. The generic NESiCA protocol
+// returns a SIMPLEBLOB instead; Windows accepts that response but the titles
+// below then feed still-encrypted resource buffers to Lua.
+static bool WantsPlaintextContentKey(int gameId)
+{
+	switch (static_cast<NesicaKey>(gameId))
+	{
+	case NesicaKey::KOFXIIIClimax:
+	case NesicaKey::BlazBlueCentralFiction:
+	case NesicaKey::BlazBlueChronoPhantasma:
+		return true;
+	default:
+		return false;
+	}
+}
+
 HANDLE PipeStuff_410550(int gameId)
 {
 	HANDLE result; // eax@1
@@ -270,12 +287,7 @@ HANDLE PipeStuff_410550(int gameId)
 					HeapFree(hHeap2, 0, v6);
 					if (Buffer)
 					{
-						// KOF XIII Climax expects the imported content key as a
-						// PLAINTEXTKEYBLOB encrypted directly with the client's RSA
-						// public key. The generic NESiCA protocol returns a SIMPLEBLOB
-						// instead; Windows accepts that response but Climax then feeds
-						// still-encrypted resource buffers to Lua.
-						if (gameId == static_cast<int>(NesicaKey::KOFXIIIClimax))
+						if (WantsPlaintextContentKey(gameId))
 						{
 							DWORD plainBlobLength = 0;
 							if (CryptExportKey(v16, 0, PLAINTEXTKEYBLOB, 0, 0, &plainBlobLength))
