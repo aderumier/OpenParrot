@@ -3,6 +3,7 @@
 #include "Utility/InitFunction.h"
 #include "Functions/Global.h"
 #include "Utility\Hooking.Patterns.h"
+#include "Utility/WineCompat.h"
 #include <Xinput.h>
 #include <math.h>
 #include <dinput.h>
@@ -58,8 +59,8 @@ static int __cdecl FontLoadRT4AndroidFallback(int image, char* fileName)
 	// Wine's D3D8 paths on the S26 fail the title's only 1024x512 font
 	// texture and the game immediately dereferences the null Font_Load result.
 	// Retry with a smaller shipped font so initialization can continue. The
-	// hook is installed only for Android below; Windows and Linux are unchanged.
-	TpInfo("FNFSB: font_dmark failed; retrying with russ512 Android fallback");
+	// hook is installed only under Wine below; native Windows is unchanged.
+	TpInfo("FNFSB: font_dmark failed; retrying with russ512 fallback");
 	char fallback[] = "system\\fonts\\russ512.tga";
 	return original_FontLoadRT4(image, fallback);
 }
@@ -432,7 +433,7 @@ static InitFunction FNFSBFunc([]()
 		MH_CreateHookApi(L"user32.dll", "SetCursorPos", &SetCursorPosRT4, (void**)&original_SetCursorPosRT4);
 		MH_CreateHookApi(L"user32.dll", "DefWindowProcA", &DefWindowProcART4, (void**)&original_DefWindowProcA4);
 		MH_CreateHookApi(L"user32.dll", "SetWindowPos", &SetWindowPosRT4, (void**)&original_SetWindowPos4);
-		if (getenv("ANDROID_ALSA_SERVER") != nullptr)
+		if (IsWineCompatEnabled())
 		{
 			MH_CreateHook((LPVOID)(mainModuleBase + 0xE6C20),
 				&FontLoadRT4AndroidFallback, (void**)&original_FontLoadRT4);

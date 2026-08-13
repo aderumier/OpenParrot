@@ -4,6 +4,7 @@
 #include "Utility/Utils.h"
 #include "NesysNewsFile.h"
 #include <Utility\GameDetect.h>
+#include "Utility/WineCompat.h"
 #pragma optimize("", off)
 
 namespace
@@ -20,7 +21,7 @@ namespace
 	bool IsAndroidGrooveNesysCompatibilityEnabled()
 	{
 		return GameDetect::currentGame == GameID::GrooveCoaster2 &&
-			getenv("ANDROID_ALSA_SERVER") != nullptr;
+			IsAndroidWineRuntime();
 	}
 
 	void AppendGrooveNesysLog(const char* message)

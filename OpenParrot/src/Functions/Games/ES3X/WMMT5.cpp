@@ -1,6 +1,7 @@
 #include <StdInc.h>
 #include "Utility/InitFunction.h"
 #include "Functions/Global.h"
+#include "Utility/WineCompat.h"
 #include <filesystem>
 #include <iostream>
 #include <cstdint>
@@ -1418,7 +1419,7 @@ static InitFunction Wmmt5Func([]()
 	// the ES3 host. Mirror WMMT6R's error-modal bypass by forcing the WMMT5
 	// local-network result mapper through its success case. The signature is
 	// shared by the supported WMMT5 executables, while the patch is Android-only.
-	if (getenv("ANDROID_ALSA_SERVER") != nullptr)
+	if (IsAndroidWineRuntime())
 	{
 		auto location = hook::get_pattern<char>(
 			"E8 ? ? ? ? 85 C0 0F 85 ? ? ? ? 48 63 84 24 ? ? ? ? 83 F8 05 77 ?");

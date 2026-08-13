@@ -5,6 +5,7 @@
 #include "Functions/Global.h"
 #include "Functions/FpsLimiter.h"
 #include "Utility/Helper.h"
+#include "Utility/WineCompat.h"
 #include <float.h>
 #if _M_IX86
 using namespace std::string_literals;
@@ -296,15 +297,16 @@ static HRESULT WINAPI ChaseDirectPlayHostDiagnostic(
 			playerContext,
 			flags);
 	ChaseWriteDirectPlayDiagnostic(result);
-	if (getenv("ANDROID_ALSA_SERVER") != nullptr && FAILED(result))
+	if (IsWineCompatEnabled() && FAILED(result))
 	{
 		// Wine's dpnet Host is a stub: it performs the local setup available to
 		// it and then reports failure. Chase treats that as a retry request and
-		// constructs peers indefinitely. Android is single-cabinet here, so
-		// accept the one local setup attempt and let Chase initialize its JVS
-		// and rendering state. Desktop Windows and Linux retain the real HRESULT.
+		// constructs peers indefinitely. Every Wine host hits this, not just
+		// Winlator, and none of them can link two cabinets through dpnet anyway,
+		// so accept the one local setup attempt and let Chase initialize its JVS
+		// and rendering state. Native Windows retains the real HRESULT.
 		ChaseAppendDirectPlayDiagnostic(
-			"Accepting Wine DirectPlay Host result for Android single-cabinet mode\r\n");
+			"Accepting Wine DirectPlay Host result for single-cabinet mode\r\n");
 		return S_OK;
 	}
 	return result;
@@ -1256,7 +1258,9 @@ static InitFunction initFunction([]()
 		}
 		case X2Type::BG4:
 		{
-			if (getenv("ANDROID_ALSA_SERVER") != nullptr &&
+			// Box64 raises STATUS_FLOAT_MULTIPLE_TRAPS for x87 sequences a real
+			// x86 FPU masks, so this recovery handler stays Android-only.
+			if (IsAndroidWineRuntime() &&
 				bg4FpuExceptionHandler == nullptr)
 			{
 				bg4FpuExceptionHandler =
@@ -1280,7 +1284,7 @@ static InitFunction initFunction([]()
 																													// Has to be done this way as TP does not patch quickly enough to prevent the initial entry point JMP, it will branch regardless (Thanks Pocky for workaround)
 																													// This shouldnt cause an issue with clean exes as they wont jump here in the first place
 
-			if (getenv("ANDROID_ALSA_SERVER") == nullptr)
+			if (!IsAndroidWineRuntime())
 			{
 				injector::WriteMemoryRaw(imageBase + 0xCBCB8, "\x8B\x84\x81\x94\x00\x00\x00\x8B\x40\x04", 10, true);	// Revert weird transmission patch?
 																										// Causes Seq/6MT to be disabled in pro mode
@@ -1368,7 +1372,9 @@ static InitFunction initFunction([]()
 		}
 		case X2Type::BG4_Eng:
 		{
-			if (getenv("ANDROID_ALSA_SERVER") != nullptr &&
+			// The resampler loop only misbehaves under Box64's x87 translation,
+			// so this stays Android-only.
+			if (IsAndroidWineRuntime() &&
 				InterlockedCompareExchange(
 					&bg4EnglishDsoundLoopPatchState, 0, 0) == 0)
 			{
@@ -1531,7 +1537,7 @@ static InitFunction initFunction([]()
 
 	if(GameDetect::currentGame == GameID::ChaseHq2)
 	{
-		if (getenv("ANDROID_ALSA_SERVER") != nullptr)
+		if (IsWineCompatEnabled())
 			ChaseAppendDirectPlayDiagnostic("Chase H.Q. 2 init entered\r\n");
 
 		// Skip calibration
@@ -1570,7 +1576,7 @@ static InitFunction initFunction([]()
 		injector::WriteMemory<DWORD>(imageBase + 0x6548C, (DWORD)cab1IP, true);
 		injector::WriteMemory<DWORD>(imageBase + 0x65C1A, (DWORD)cab1IP, true);
 
-		if (getenv("ANDROID_ALSA_SERVER") != nullptr)
+		if (IsWineCompatEnabled())
 		{
 			// This five-byte call replaces Chase's three-byte indirect Host call
 			// and its following TEST EAX,EAX. The thunk preserves the original
@@ -1585,7 +1591,9 @@ static InitFunction initFunction([]()
 	
 	if(GameDetect::currentGame == GameID::TetrisGM3)
 	{
-		if (getenv("ANDROID_ALSA_SERVER") != nullptr)
+		// High-refresh phone panels, not Wine, are what runs TGM3's frame-based
+		// logic too fast, so this stays Android-only.
+		if (IsAndroidWineRuntime())
 		{
 			FpsLimiterSet(60.0f);
 			TetrisSwapBuffersOriginal = iatHook(
@@ -1766,16 +1774,15 @@ static InitFunction initFunction([]()
 		injector::WriteMemory<DWORD>(imageBase + 0xA6ECF, (DWORD)cab1IP, true);
 		injector::WriteMemory<DWORD>(imageBase + 0xA7371, (DWORD)cab1IP, true);
 
-		// Android cannot grant a Wine process CAP_NET_ADMIN, and Wine's
-		// AddIPAddress implementation is an ERROR_NOT_SUPPORTED stub.  Wacky
+		// Wine's AddIPAddress implementation is an ERROR_NOT_SUPPORTED stub on
+		// every host, and even a real one would need CAP_NET_ADMIN.  Wacky
 		// Races crashes while formatting that error before DirectPlay can bind
-		// its socket.  Keep the Windows and desktop-Wine paths untouched; the
-		// Android ALSA bridge variable is injected only by Winlator.  The output
-		// outputs must be zeroed so DeleteIPAddress(0) is harmless during
+		// its socket.  Keep the native Windows path untouched.  The output
+		// handles must be zeroed so DeleteIPAddress(0) is harmless during
 		// shutdown. Keep a real WINAPI call target rather than NOPing the call:
 		// AddIPAddress is stdcall on x86 and is responsible for popping its five
 		// arguments from the caller's stack.
-		if (getenv("ANDROID_ALSA_SERVER") != nullptr)
+		if (IsWineCompatEnabled())
 			injector::MakeCALL(
 				imageBase + 0xA45B5, AddIPAddressAndroidWrap, true);
 	}
@@ -2017,7 +2024,7 @@ static InitFunction initFunction([]()
 		// the exact title-local PhysXCore runtime is present. Keep the
 		// loader and game binaries untouched and make only this in-memory
 		// predicate report that the local runtime is available.
-		if (getenv("ANDROID_ALSA_SERVER") != nullptr)
+		if (IsWineCompatEnabled())
 		{
 			if (HMODULE physXLoader = GetModuleHandleA("PhysXLoader.dll"))
 			{

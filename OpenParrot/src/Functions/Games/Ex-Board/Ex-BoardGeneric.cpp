@@ -1,6 +1,7 @@
 #include <StdInc.h>
 #include "Utility/InitFunction.h"
 #include "Functions/Global.h"
+#include "Utility/WineCompat.h"
 #include <deque>
 #include <d3d9.h>
 // BASED ON xb_monitor by zxmarcos https://github.com/zxmarcos/xb_monitor
@@ -63,9 +64,7 @@ static const char* ResolveDaemonBrideFlashRomPath(LPCSTR fileName)
 
 static bool IsExBoardRunningUnderWine()
 {
-	const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-	return ntdll != nullptr &&
-		GetProcAddress(ntdll, "wine_get_version") != nullptr;
+	return IsWineCompatEnabled();
 }
 
 // DB1 renders into a 16-bit R5G6B5 D3D9 back buffer.  Under Wine/DXVK the

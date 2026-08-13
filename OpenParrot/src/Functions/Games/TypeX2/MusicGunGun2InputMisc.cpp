@@ -2,6 +2,7 @@
 #include "Utility/GameDetect.h"
 #include "Utility/InitFunction.h"
 #include "Functions/Global.h"
+#include "Utility/WineCompat.h"
 #include "Utility/Helper.h"
 #include <d3d9.h>
 
@@ -55,7 +56,7 @@ namespace
 
 void InstallMusicGunGun2AndroidD3D9Compatibility()
 {
-	if (getenv("ANDROID_ALSA_SERVER") == nullptr)
+	if (!IsAndroidWineRuntime())
 		return;
 
 	// Under the Android x86 bridge, the game's original inline COM dispatch can

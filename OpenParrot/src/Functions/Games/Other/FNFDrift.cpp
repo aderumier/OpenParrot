@@ -1,6 +1,7 @@
 #include <StdInc.h>
 #include "Utility/InitFunction.h"
 #include "Functions/Global.h"
+#include "Utility/WineCompat.h"
 #include "Utility\Hooking.Patterns.h"
 #include <Xinput.h>
 #include <math.h>
@@ -39,7 +40,7 @@ DWORD WINAPI InputRT(LPVOID lpParam)
 {
 	int deltaTimer = 16;
 	INT_PTR keyboardBuffer = (0x41B5920 + BaseAddress);
-	const bool androidTouchInput = getenv("ANDROID_ALSA_SERVER") != nullptr;
+	const bool androidTouchInput = IsAndroidWineRuntime();
 
 	while (true)
 	{

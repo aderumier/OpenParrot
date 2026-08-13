@@ -2,6 +2,7 @@
 #include "Utility/InitFunction.h"
 #include "Functions/Global.h"
 #include "Utility\Hooking.Patterns.h"
+#include "Utility/WineCompat.h"
 #include <Xinput.h>
 #include <winbase.h>
 #include <math.h>
@@ -577,10 +578,10 @@ DWORD WINAPI WindowRT8(LPVOID lpParam)
 			else ShowWindow(hWndRT8, SW_SHOWDEFAULT);
 		}
 		// This helper only polls mouse buttons for optional window movement.
-		// Yield between polls on Android so it does not consume an entire guest
-		// CPU core and starve the engine's startup work under Box64/Winlator.
+		// Yield between polls under Wine so it does not consume an entire CPU
+		// core and starve the engine's startup work.
 		// Preserve the established native Windows polling behavior.
-		if (getenv("ANDROID_ALSA_SERVER") != nullptr)
+		if (IsWineCompatEnabled())
 			Sleep(16);
 	}
 }
@@ -639,7 +640,10 @@ static InitFunction JLeagueFunc([]()
 {
 	GetDesktopResolution(horizontal8, vertical8);
 
-	if (getenv("ANDROID_ALSA_SERVER") != nullptr)
+	// DX9Renderer.dlo divides by the render dimensions the moment it is loaded,
+	// and any Wine host can still report zero there while Winex11 is mapping
+	// the window. The guards below only clamp that transient case.
+	if (IsWineCompatEnabled())
 	{
 		CreateThread(NULL, 0, InstallJusticeLeagueAspectGuard, NULL, 0, NULL);
 	}
@@ -654,10 +658,9 @@ static InitFunction JLeagueFunc([]()
 
 	// The optional mouse drag/minimize helper enters User32 from a secondary
 	// thread while Wine is still bringing up Winex11. It is not useful with the
-	// Android touch overlay and can race Winex11 initialization, so keep the
-	// established helper only on native Windows.
-	if (ToBool(config["General"]["Windowed"]) &&
-		getenv("ANDROID_ALSA_SERVER") == nullptr)
+	// Android touch overlay and can race Winex11 initialization there, so drop
+	// it only on Android; native Windows and desktop Wine keep the helper.
+	if (ToBool(config["General"]["Windowed"]) && !IsAndroidWineRuntime())
 	{
 		CreateThread(NULL, 0, WindowRT8, NULL, 0, NULL);
 	}
