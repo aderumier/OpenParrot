@@ -68,14 +68,3 @@ wchar_t* GetFileVersion(const wchar_t* pszFilePath)
 
 	return versionString;
 }
-
-bool IsRunningUnderWine()
-{
-	static const bool underWine = []()
-	{
-		const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-		return ntdll != nullptr &&
-			GetProcAddress(ntdll, "wine_get_version") != nullptr;
-	}();
-	return underWine;
-}

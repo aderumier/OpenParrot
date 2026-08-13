@@ -62,7 +62,9 @@ bool IsWineCompatEnabled()
 	if (forced != Tristate::Unknown)
 		return forced == Tristate::True;
 
-	// The Android runtime is a Wine host too, but keep the environment check as
-	// a fallback in case a Winlator build hides wine_get_version.
-	return IsRunningUnderWine() || IsAndroidWineRuntime();
+	// This branch targets Wine exclusively, so the compatibility paths are on by
+	// default instead of being gated on host detection. Wine Staging can be
+	// built or configured to hide ntdll's wine_* exports, and falling back to
+	// the native Windows paths there would be a silent loss of every fix below.
+	return true;
 }

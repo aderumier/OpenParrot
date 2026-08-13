@@ -36,20 +36,18 @@ char* LoaderExe = "OpenParrotLoader64.exe";
 // MXCSR in wow64 threads, which unmasks SSE exceptions and kills the game with
 // STATUS_FLOAT_MULTIPLE_TRAPS (0xC00002B5) on the first inexact float operation
 // in DllMain. Remote-thread injection never touches the main thread context, so
-// adopt it as the default under Wine and behave the same whether or not the
-// launch came through the UI.
+// adopt it as the default and behave the same whether or not the launch came
+// through the UI. This branch targets Wine exclusively, so the default is
+// unconditional rather than gated on host detection.
 //
 // The variable is still honoured when set: 0/false/off restores the original
-// entry-point injection, and any other value enables remote-thread injection,
-// including on native Windows.
+// entry-point injection, and any other value enables remote-thread injection.
 static bool ShouldUseRemoteThread()
 {
 	wchar_t envVar[256] = { 0 };
 	DWORD result = GetEnvironmentVariable(
 		L"TP_REMOTETHREAD", envVar, static_cast<DWORD>(std::size(envVar)));
-	if (result == 0)
-		return IsRunningUnderWine();
-	if (result >= std::size(envVar))
+	if (result == 0 || result >= std::size(envVar))
 		return true;
 
 	return _wcsicmp(envVar, L"0") != 0 &&

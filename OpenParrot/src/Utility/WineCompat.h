@@ -24,9 +24,12 @@ bool IsRunningUnderWine();
 bool IsAndroidWineRuntime();
 
 // Gate for compatibility work that addresses a Wine limitation rather than an
-// Android/Box64 one. True under any Wine host.
+// Android/Box64 one.
 //
-// TP_FORCE_WINE overrides the detection: set it to 0/false/off to keep the
-// original native behaviour under Wine, or to any other value to exercise the
-// same code paths on native Windows.
+// This branch targets Wine exclusively, so it is true by default rather than
+// conditional on IsRunningUnderWine(): a prefix that hides ntdll's wine_*
+// exports must not silently fall back to the native Windows paths.
+//
+// TP_FORCE_WINE=0/false/off turns the whole group off again, which is the way
+// to check whether one of these paths is responsible for a regression.
 bool IsWineCompatEnabled();
