@@ -3,7 +3,9 @@
 #include "Utility/GameDetect.h"
 #include "Utility/InitFunction.h"
 #include "Functions/Global.h"
+#include "Functions/FpsLimiter.h"
 #include "Utility/Helper.h"
+#include <float.h>
 #if _M_IX86
 using namespace std::string_literals;
 extern int* wheelSection;
@@ -25,6 +27,400 @@ extern void GaiaAttack4Inputs(Helpers* helpers);
 static bool ProMode;
 extern bool BG4EnableTracks;
 bool FFBReportWheelPosition;
+
+static BOOL(WINAPI* TetrisSwapBuffersOriginal)(HDC) = nullptr;
+
+static BOOL WINAPI TetrisSwapBuffersAndroid(HDC deviceContext)
+{
+	// TGM3 renders through OpenGL/Zink. DXVK's D3D frame limiter therefore
+	// never sees its presents, and high-refresh Android displays run the
+	// frame-based game logic too quickly. Throttle only this title's imported
+	// SwapBuffers call; Windows and desktop Wine retain their native timing.
+	FpsLimiter();
+	return TetrisSwapBuffersOriginal(deviceContext);
+}
+
+static constexpr DWORD bg4FloatMultipleTraps = 0xC00002B5;
+static PVOID bg4FpuExceptionHandler = nullptr;
+static DWORD bg4LastFpuExceptionIp = 0;
+
+static LONG CALLBACK BG4FpuExceptionRecovery(
+	PEXCEPTION_POINTERS exceptionPointers)
+{
+	if (!exceptionPointers ||
+		!exceptionPointers->ExceptionRecord ||
+		!exceptionPointers->ContextRecord ||
+		exceptionPointers->ExceptionRecord->ExceptionCode !=
+			bg4FloatMultipleTraps)
+		return EXCEPTION_CONTINUE_SEARCH;
+
+	CONTEXT* context = exceptionPointers->ContextRecord;
+	const DWORD exceptionIp = context->Eip;
+
+	HMODULE containingModule = nullptr;
+	char moduleName[MAX_PATH] = {};
+	if (GetModuleHandleExA(
+			GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+				GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			reinterpret_cast<LPCSTR>(exceptionIp),
+			&containingModule) &&
+		containingModule)
+		GetModuleFileNameA(containingModule, moduleName, _countof(moduleName));
+
+	BYTE instruction[8] = {};
+	memcpy(instruction, reinterpret_cast<const void*>(exceptionIp),
+		sizeof(instruction));
+	TpInfo(
+		"BG4 Android: x87 trap at %s+%08x, bytes "
+		"%02x %02x %02x %02x %02x %02x %02x %02x",
+		moduleName[0] ? moduleName : "<unknown>",
+		containingModule
+			? exceptionIp - reinterpret_cast<DWORD>(containingModule)
+			: exceptionIp,
+		instruction[0], instruction[1], instruction[2], instruction[3],
+		instruction[4], instruction[5], instruction[6], instruction[7]);
+
+	// A retry is safe only once per instruction. If the instruction itself
+	// generates an unmaskable Box64 trap, allow Wine to terminate normally
+	// rather than spinning the game thread forever.
+	if (bg4LastFpuExceptionIp == exceptionIp)
+		return EXCEPTION_CONTINUE_SEARCH;
+	bg4LastFpuExceptionIp = exceptionIp;
+
+	_clearfp();
+	unsigned int controlWord = 0;
+	_controlfp_s(&controlWord, _MCW_EM, _MCW_EM);
+
+	// Wine resumes from the saved CONTEXT, so repair both its legacy x87 copy
+	// and the FXSAVE image restored by RtlRestoreContext. This is title- and
+	// Android-scoped because native Windows does not exhibit the Box64 state
+	// leak and must retain the cabinet executable's original floating policy.
+	context->FloatSave.ControlWord |= 0x3F;
+	context->FloatSave.StatusWord &= ~0x3F;
+	BYTE* extendedRegisters = context->ExtendedRegisters;
+	*reinterpret_cast<WORD*>(extendedRegisters) |= 0x3F;
+	*reinterpret_cast<WORD*>(extendedRegisters + 2) &= ~0x3F;
+	DWORD* savedMxCsr =
+		reinterpret_cast<DWORD*>(extendedRegisters + 24);
+	*savedMxCsr = (*savedMxCsr | 0x1F80) & ~0x3F;
+	return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+static DWORD bg4EnglishDsoundLoopReturn = 0;
+static volatile LONG bg4EnglishDsoundLoopPatchState = 0;
+
+static __declspec(naked) void BG4EnglishDsoundResampleLoopAndroid()
+{
+	__asm
+	{
+		// Wine's resampler deliberately permits a one-column buffer. Its x87
+		// path yields infinity/NaN with masked exceptions, but Box64 turns that
+		// degenerate divide into STATUS_FLOAT_MULTIPLE_TRAPS. Silence only that
+		// invalid sample; normal buffers retain the equivalent resampling math.
+		cmp dword ptr [ebp + 8], 1
+		jle write_silence
+
+		sub esp, 32
+		movups [esp], xmm0
+		movups [esp + 16], xmm1
+
+		movss xmm1, dword ptr [ebp - 14h]
+		cvtsi2ss xmm0, dword ptr [ebp + 0Ch]
+		addss xmm0, xmm1
+
+		cmp ecx, dword ptr [ebp - 8]
+		je use_reciprocal
+		movss xmm1, dword ptr [eax]
+
+	use_reciprocal:
+		mulss xmm1, dword ptr [ebp - 18h]
+		divss xmm1, xmm0
+		movss dword ptr [eax], xmm1
+
+		movups xmm0, [esp]
+		movups xmm1, [esp + 16]
+		add esp, 32
+		jmp advance_sample
+
+	write_silence:
+		mov dword ptr [eax], 0
+
+	advance_sample:
+		inc ecx
+		add eax, 4
+		push dword ptr [bg4EnglishDsoundLoopReturn]
+		ret
+	}
+}
+
+static bool InstallBG4EnglishDsoundLoopPatch()
+{
+	const LONG patchState = InterlockedCompareExchange(
+		&bg4EnglishDsoundLoopPatchState, 0, 0);
+	if (patchState != 0)
+		return patchState > 0;
+
+	HMODULE dsound = GetModuleHandleA("DSOUND.dll");
+	if (dsound == nullptr)
+		return false;
+
+	BYTE* const loopStart = reinterpret_cast<BYTE*>(dsound) + 0x476B5;
+	static const BYTE expected[] = { 0x3B, 0x4D, 0xF8, 0x75, 0x05 };
+	if (memcmp(loopStart, expected, sizeof(expected)) != 0)
+	{
+		TpInfo("BG4 Android: unsupported DSOUND resampler signature");
+		InterlockedExchange(&bg4EnglishDsoundLoopPatchState, -1);
+		return false;
+	}
+
+	bg4EnglishDsoundLoopReturn =
+		reinterpret_cast<DWORD>(dsound) + 0x476CC;
+	const intptr_t displacement =
+		reinterpret_cast<BYTE*>(&BG4EnglishDsoundResampleLoopAndroid) -
+		(loopStart + 5);
+
+	DWORD oldProtection = 0;
+	if (!VirtualProtect(
+			loopStart,
+			sizeof(expected),
+			PAGE_EXECUTE_READWRITE,
+			&oldProtection))
+		return false;
+
+	loopStart[0] = 0xE9;
+	*reinterpret_cast<int32_t*>(loopStart + 1) =
+		static_cast<int32_t>(displacement);
+	FlushInstructionCache(GetCurrentProcess(), loopStart, sizeof(expected));
+	DWORD ignoredProtection = 0;
+	VirtualProtect(
+		loopStart,
+		sizeof(expected),
+		oldProtection,
+		&ignoredProtection);
+	InterlockedExchange(&bg4EnglishDsoundLoopPatchState, 1);
+	TpInfo("BG4 Android: installed one-column DirectSound guard");
+	return true;
+}
+
+static DWORD WINAPI BG4EnglishDsoundPatchThread(LPVOID)
+{
+	for (unsigned int attempt = 0; attempt < 3000; ++attempt)
+	{
+		if (InstallBG4EnglishDsoundLoopPatch())
+			return 0;
+		if (InterlockedCompareExchange(
+				&bg4EnglishDsoundLoopPatchState, 0, 0) < 0)
+			return 1;
+		Sleep(10);
+	}
+
+	TpInfo("BG4 Android: DSOUND resampler did not load within 30 seconds");
+	return 2;
+}
+
+typedef HRESULT(WINAPI* ChaseDirectPlayHost_t)(
+	void* peer,
+	const void* applicationDescription,
+	void* const* deviceAddresses,
+	DWORD deviceAddressCount,
+	const void* securityDescription,
+	const void* credentials,
+	void* playerContext,
+	DWORD flags);
+
+static void ChaseAppendDirectPlayDiagnostic(const char* line)
+{
+	if (line == nullptr || line[0] == '\0')
+		return;
+
+	HANDLE log = CreateFileA(
+		"E:\\TeknoParrotRuntime\\OpenParrotWin32\\ChaseDirectPlayHost.log",
+		FILE_APPEND_DATA,
+		FILE_SHARE_READ | FILE_SHARE_WRITE,
+		nullptr,
+		OPEN_ALWAYS,
+		FILE_ATTRIBUTE_NORMAL,
+		nullptr);
+	if (log == INVALID_HANDLE_VALUE)
+		return;
+
+	const DWORD length = static_cast<DWORD>(strlen(line));
+	DWORD bytesWritten = 0;
+	WriteFile(log, line, length, &bytesWritten, nullptr);
+	CloseHandle(log);
+}
+
+static void ChaseWriteDirectPlayDiagnostic(HRESULT result)
+{
+	char line[128] = {};
+	_snprintf_s(
+		line,
+		_countof(line),
+		_TRUNCATE,
+		"IDirectPlay8Peer::Host returned 0x%08X\r\n",
+		static_cast<unsigned int>(result));
+	ChaseAppendDirectPlayDiagnostic(line);
+}
+
+static HRESULT WINAPI ChaseDirectPlayHostDiagnostic(
+	void* peer,
+	const void* applicationDescription,
+	void* const* deviceAddresses,
+	DWORD deviceAddressCount,
+	const void* securityDescription,
+	const void* credentials,
+	void* playerContext,
+	DWORD flags)
+{
+	if (peer == nullptr)
+	{
+		ChaseWriteDirectPlayDiagnostic(E_POINTER);
+		return E_POINTER;
+	}
+
+	void** vtable = *reinterpret_cast<void***>(peer);
+	if (vtable == nullptr || vtable[9] == nullptr)
+	{
+		ChaseWriteDirectPlayDiagnostic(E_NOINTERFACE);
+		return E_NOINTERFACE;
+	}
+
+	const HRESULT result =
+		reinterpret_cast<ChaseDirectPlayHost_t>(vtable[9])(
+			peer,
+			applicationDescription,
+			deviceAddresses,
+			deviceAddressCount,
+			securityDescription,
+			credentials,
+			playerContext,
+			flags);
+	ChaseWriteDirectPlayDiagnostic(result);
+	if (getenv("ANDROID_ALSA_SERVER") != nullptr && FAILED(result))
+	{
+		// Wine's dpnet Host is a stub: it performs the local setup available to
+		// it and then reports failure. Chase treats that as a retry request and
+		// constructs peers indefinitely. Android is single-cabinet here, so
+		// accept the one local setup attempt and let Chase initialize its JVS
+		// and rendering state. Desktop Windows and Linux retain the real HRESULT.
+		ChaseAppendDirectPlayDiagnostic(
+			"Accepting Wine DirectPlay Host result for Android single-cabinet mode\r\n");
+		return S_OK;
+	}
+	return result;
+}
+
+static void __declspec(naked) ChaseDirectPlayHostDiagnosticThunk()
+{
+	__asm
+	{
+		push ebp
+		mov ebp, esp
+		push dword ptr [ebp + 24h]
+		push dword ptr [ebp + 20h]
+		push dword ptr [ebp + 1Ch]
+		push dword ptr [ebp + 18h]
+		push dword ptr [ebp + 14h]
+		push dword ptr [ebp + 10h]
+		push dword ptr [ebp + 0Ch]
+		push dword ptr [ebp + 08h]
+		call ChaseDirectPlayHostDiagnostic
+		test eax, eax
+		mov esp, ebp
+		pop ebp
+		ret 20h
+	}
+}
+
+static int(__fastcall* KofXiiiMovieQueryOriginal)(void* thisPointer, void* edx);
+static void HideCompletedKofXiiiMovieWindow();
+
+static int __fastcall KofXiiiMovieQueryHook(void* thisPointer, void* edx)
+{
+	if (!thisPointer ||
+		*reinterpret_cast<void**>(
+			reinterpret_cast<BYTE*>(thisPointer) + 0x34) == nullptr)
+	{
+		static bool loggedMissingInterface = false;
+		if (!loggedMissingInterface)
+		{
+			loggedMissingInterface = true;
+			TpInfo(
+				"KOF XIII Android: DirectShow movie interface is unavailable; returning a neutral query result");
+		}
+		HideCompletedKofXiiiMovieWindow();
+		return 0;
+	}
+
+	return KofXiiiMovieQueryOriginal(thisPointer, edx);
+}
+
+static bool(__fastcall* KofXiiiMovieUpdateOriginal)(void* thisPointer, void* edx);
+
+static void HideCompletedKofXiiiMovieWindow()
+{
+	HWND movieWindow = FindWindowW(nullptr, L"ActiveMovie Window");
+	if (movieWindow == nullptr)
+		return;
+
+	DWORD movieProcessId = 0;
+	GetWindowThreadProcessId(movieWindow, &movieProcessId);
+	if (movieProcessId != GetCurrentProcessId())
+		return;
+
+	ShowWindow(movieWindow, SW_HIDE);
+}
+
+static bool __fastcall KofXiiiMovieUpdateHook(void* thisPointer, void* edx)
+{
+	if (!thisPointer ||
+		*reinterpret_cast<void**>(
+			reinterpret_cast<BYTE*>(thisPointer) + 0x34) == nullptr)
+	{
+		static bool loggedSkippedMovie = false;
+		if (!loggedSkippedMovie)
+		{
+			loggedSkippedMovie = true;
+			TpInfo(
+				"KOF XIII Android: DirectShow movie interface is unavailable; reporting the movie as complete");
+		}
+		HideCompletedKofXiiiMovieWindow();
+		return true;
+	}
+
+	const bool movieComplete =
+		KofXiiiMovieUpdateOriginal(thisPointer, edx);
+	if (movieComplete)
+		HideCompletedKofXiiiMovieWindow();
+
+	return movieComplete;
+}
+
+static void(__fastcall* KofXiiiMoviePositionOriginal)(
+	void* thisPointer,
+	void* edx,
+	void* position);
+static void __fastcall KofXiiiMoviePositionHook(
+	void* thisPointer,
+	void* edx,
+	void* position)
+{
+	if (!thisPointer ||
+		*reinterpret_cast<void**>(
+			reinterpret_cast<BYTE*>(thisPointer) + 0x34) == nullptr)
+	{
+		static bool loggedMissingInterface = false;
+		if (!loggedMissingInterface)
+		{
+			loggedMissingInterface = true;
+			TpInfo(
+				"KOF XIII Android: DirectShow movie interface is unavailable; ignoring the movie-position update");
+		}
+		return;
+	}
+
+	KofXiiiMoviePositionOriginal(thisPointer, edx, position);
+}
 
 // EADP
 extern int(__fastcall* EADPVolumeSetupOri)(void* ECX, void* EDX, float a2);
@@ -60,6 +456,7 @@ extern char* __cdecl MusicGunGun2strncpy(char* Destination, const char* Source, 
 extern HWND(WINAPI* MusicGunGun2CreateWindowExAOri)(DWORD dwExStyle, LPCSTR lpClassName, LPCSTR lpWindowName, DWORD dwStyle, int X, int Y, int nWidth, int nHeight, HWND hWndParent, HMENU hMenu, HINSTANCE hInstance, LPVOID lpParam);
 extern HWND WINAPI MusicGunGun2CreateWindowExAHook(DWORD dwExStyle, LPCSTR lpClassName, LPCSTR lpWindowName, DWORD dwStyle, int X, int Y, int nWidth, int nHeight, HWND hWndParent, HMENU hMenu, HINSTANCE hInstance, LPVOID lpParam);
 extern UINT8 MusicGunGun2Volume;
+extern void InstallMusicGunGun2AndroidD3D9Compatibility();
 
 // Haunted Museum
 extern HWND(WINAPI* HauntedMuseumCreateWindowExAOri)(DWORD dwExStyle, LPCSTR lpClassName, LPCSTR lpWindowName, DWORD dwStyle, int X, int Y, int nWidth, int nHeight, HWND hWndParent, HMENU hMenu, HINSTANCE hInstance, LPVOID lpParam);
@@ -98,6 +495,35 @@ static std::string ParseFileNamesA(LPCSTR lpFileName)
 #ifdef _DEBUG
 	info("ParseFileNamesA original: %s", lpFileName);
 #endif
+	// KOF XIII Climax builds absolute media paths from a lower-case copy of the
+	// executable directory. The generic redirect below compares that path
+	// case-sensitively and otherwise turns a valid D:\TeknoParrotGames\... path
+	// into .\OpenParrot\teknoparrotgames\..., which is nested under the game
+	// directory. Some Climax dumps retain the Type X KOF XIII CRC,
+	// so accept both detector IDs and preserve the already-correct path.
+	if ((GameDetect::currentGame == GameID::KOFXIIIClimax ||
+		 GameDetect::currentGame == GameID::KOFXIII) &&
+		lpFileName != nullptr &&
+		(lpFileName[0] == 'D' || lpFileName[0] == 'd') &&
+		lpFileName[1] == ':' &&
+		(lpFileName[2] == '\\' || lpFileName[2] == '/'))
+	{
+		char pathRoot[MAX_PATH] = {};
+		GetModuleFileNameA(
+			GetModuleHandle(nullptr), pathRoot, _countof(pathRoot));
+		char* separator = strrchr(pathRoot, '\\');
+		if (separator != nullptr)
+		{
+			*separator = '\0';
+			const size_t rootLength = strlen(pathRoot);
+			if (_strnicmp(lpFileName, pathRoot, rootLength) == 0 &&
+				(lpFileName[rootLength] == '\0' ||
+				 lpFileName[rootLength] == '\\' ||
+				 lpFileName[rootLength] == '/'))
+				return lpFileName;
+		}
+	}
+
 	// Tetris ram folder redirect
 	if (!strncmp(lpFileName, ".\\TGM3\\", 7)) 
 	{
@@ -263,6 +689,29 @@ static std::wstring ParseFileNamesW(LPCWSTR lpFileName)
 #ifdef _DEBUG
 	info("ParseFileNamesW original: %ls", lpFileName);
 #endif
+	if ((GameDetect::currentGame == GameID::KOFXIIIClimax ||
+		 GameDetect::currentGame == GameID::KOFXIII) &&
+		lpFileName != nullptr &&
+		(lpFileName[0] == L'D' || lpFileName[0] == L'd') &&
+		lpFileName[1] == L':' &&
+		(lpFileName[2] == L'\\' || lpFileName[2] == L'/'))
+	{
+		wchar_t pathRoot[MAX_PATH] = {};
+		GetModuleFileNameW(
+			GetModuleHandle(nullptr), pathRoot, _countof(pathRoot));
+		wchar_t* separator = wcsrchr(pathRoot, L'\\');
+		if (separator != nullptr)
+		{
+			*separator = L'\0';
+			const size_t rootLength = wcslen(pathRoot);
+			if (_wcsnicmp(lpFileName, pathRoot, rootLength) == 0 &&
+				(lpFileName[rootLength] == L'\0' ||
+				 lpFileName[rootLength] == L'\\' ||
+				 lpFileName[rootLength] == L'/'))
+				return lpFileName;
+		}
+	}
+
 	if (!wcsncmp(lpFileName, L"D:", 2) || !wcsncmp(lpFileName, L"d:", 2))
 	{
 		memset(moveBufW, 0, 256);
@@ -342,10 +791,19 @@ static std::wstring ParseFileNamesW(LPCWSTR lpFileName)
 
 static BOOL __stdcall SetCurrentDirectoryAWrap(LPCSTR lpPathName)
 {
-	char pathRoot[MAX_PATH];
-	GetModuleFileNameA(GetModuleHandleA(nullptr), pathRoot, _countof(pathRoot)); // get full pathname to game executable
-
-	strrchr(pathRoot, '\\')[0] = '\0'; // chop off everything from the last backslash.
+	char pathRoot[MAX_PATH] = {};
+	DWORD requestedLength = GetEnvironmentVariableA(
+		"TP_GAME_WORKING_DIRECTORY", pathRoot, _countof(pathRoot));
+	DWORD requestedAttributes = requestedLength > 0 && requestedLength < _countof(pathRoot)
+		? GetFileAttributesA(pathRoot)
+		: INVALID_FILE_ATTRIBUTES;
+	if (requestedAttributes == INVALID_FILE_ATTRIBUTES ||
+		(requestedAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+	{
+		GetModuleFileNameA(
+			GetModuleHandleA(nullptr), pathRoot, _countof(pathRoot)); // get full pathname to game executable
+		strrchr(pathRoot, '\\')[0] = '\0'; // chop off everything from the last backslash.
+	}
 #ifdef _DEBUG
 	info("SetCurrentDirectoryA: %s", lpPathName);
 #endif
@@ -366,6 +824,23 @@ static BOOL __stdcall SetCurrentDirectoryAWrap(LPCSTR lpPathName)
 	}
 
 	return SetCurrentDirectoryA((pathRoot + ""s).c_str());
+}
+
+static DWORD WINAPI AddIPAddressAndroidWrap(
+	DWORD address,
+	DWORD mask,
+	DWORD interfaceIndex,
+	PULONG nteContext,
+	PULONG nteInstance)
+{
+	(void)address;
+	(void)mask;
+	(void)interfaceIndex;
+	if (nteContext != nullptr)
+		*nteContext = 0;
+	if (nteInstance != nullptr)
+		*nteInstance = 0;
+	return NO_ERROR;
 }
 
 static HANDLE __stdcall CreateFileAWrap(LPCSTR lpFileName,
@@ -781,6 +1256,16 @@ static InitFunction initFunction([]()
 		}
 		case X2Type::BG4:
 		{
+			if (getenv("ANDROID_ALSA_SERVER") != nullptr &&
+				bg4FpuExceptionHandler == nullptr)
+			{
+				bg4FpuExceptionHandler =
+					AddVectoredExceptionHandler(1, BG4FpuExceptionRecovery);
+				unsigned int controlWord = 0;
+				_clearfp();
+				_controlfp_s(&controlWord, _MCW_EM, _MCW_EM);
+			}
+
 			// Fix sound only being in left ear
 			injector::WriteMemoryRaw(imageBase + 0x36C3DC, "\x00\x60\xA9\x45", 4, true);
 
@@ -795,8 +1280,22 @@ static InitFunction initFunction([]()
 																													// Has to be done this way as TP does not patch quickly enough to prevent the initial entry point JMP, it will branch regardless (Thanks Pocky for workaround)
 																													// This shouldnt cause an issue with clean exes as they wont jump here in the first place
 
-			injector::WriteMemoryRaw(imageBase + 0xCBCB8, "\x8B\x84\x81\x94\x00\x00\x00\x8B\x40\x04", 10, true);	// Revert weird transmission patch?
-																													// Causes Seq/6MT to be disabled in pro mode
+			if (getenv("ANDROID_ALSA_SERVER") == nullptr)
+			{
+				injector::WriteMemoryRaw(imageBase + 0xCBCB8, "\x8B\x84\x81\x94\x00\x00\x00\x8B\x40\x04", 10, true);	// Revert weird transmission patch?
+																										// Causes Seq/6MT to be disabled in pro mode
+			}
+			else
+			{
+				// Tuned 2.08 uses this lookup while resolving its selected
+				// transmission entry. Retain the commonly distributed forced-index
+				// patch only in Android process memory, leaving the executable and
+				// CRC untouched. This is not a generic post-calibration black-screen
+				// bypass: original BG4 (`BG4_Eng`) has a different layout and no
+				// verified equivalent at this offset. Desktop Windows/Linux retain
+				// the clean Tuned lookup and their normal pro-mode behavior.
+				injector::WriteMemoryRaw(imageBase + 0xCBCB8, "\xB8\x01\x00\x00\x00\x90\x90\x90\x90\x90", 10, true);
+			}
 			// End of dirty executable patches
 			
 			if (ToBool(config["General"]["IntroFix"]))
@@ -869,6 +1368,24 @@ static InitFunction initFunction([]()
 		}
 		case X2Type::BG4_Eng:
 		{
+			if (getenv("ANDROID_ALSA_SERVER") != nullptr &&
+				InterlockedCompareExchange(
+					&bg4EnglishDsoundLoopPatchState, 0, 0) == 0)
+			{
+				// The Android runtime can load DirectSound after OpenParrot. Patch the
+				// verified in-memory resampler when it appears; the Wine DLL on disk,
+				// native Windows, desktop Wine, and every other game remain untouched.
+				HANDLE patchThread = CreateThread(
+					nullptr,
+					0,
+					BG4EnglishDsoundPatchThread,
+					nullptr,
+					0,
+					nullptr);
+				if (patchThread != nullptr)
+					CloseHandle(patchThread);
+			}
+
 			if (ToBool(config["General"]["IntroFix"]))
 			{
 				// thanks for Ducon2016 for the patch!
@@ -1014,6 +1531,9 @@ static InitFunction initFunction([]()
 
 	if(GameDetect::currentGame == GameID::ChaseHq2)
 	{
+		if (getenv("ANDROID_ALSA_SERVER") != nullptr)
+			ChaseAppendDirectPlayDiagnostic("Chase H.Q. 2 init entered\r\n");
+
 		// Skip calibration
 		injector::WriteMemory<BYTE>(imageBase + 0x107E3, 0xEB, true);
 
@@ -1049,10 +1569,30 @@ static InitFunction initFunction([]()
 		//injector::WriteMemory<DWORD>(imageBase + 0x643C0, (DWORD)cab4IP, true); // unused, leftover code?
 		injector::WriteMemory<DWORD>(imageBase + 0x6548C, (DWORD)cab1IP, true);
 		injector::WriteMemory<DWORD>(imageBase + 0x65C1A, (DWORD)cab1IP, true);
+
+		if (getenv("ANDROID_ALSA_SERVER") != nullptr)
+		{
+			// This five-byte call replaces Chase's three-byte indirect Host call
+			// and its following TEST EAX,EAX. The thunk preserves the original
+			// stdcall stack cleanup and recreates the flags used by the JGE at
+			// imageBase + 0x624F8 after recording Wine's exact HRESULT.
+			injector::MakeCALL(
+				imageBase + 0x624F0,
+				ChaseDirectPlayHostDiagnosticThunk,
+				true);
+		}
 	}
 	
 	if(GameDetect::currentGame == GameID::TetrisGM3)
 	{
+		if (getenv("ANDROID_ALSA_SERVER") != nullptr)
+		{
+			FpsLimiterSet(60.0f);
+			TetrisSwapBuffersOriginal = iatHook(
+				"gdi32.dll",
+				TetrisSwapBuffersAndroid,
+				"SwapBuffers");
+		}
 		// TODO: DOCUMENT PATCHES
 		injector::WriteMemory<DWORD>(0x0046A0AC, 0x00005C2E, true); //required to boot
 		// windowed mode patch (if set to windowed in config) Makes it a proper windowed app. Not the first person to have done this patch
@@ -1225,6 +1765,19 @@ static InitFunction initFunction([]()
 		injector::WriteMemory<DWORD>(imageBase + 0xA4582, (DWORD)cab4IP, true);
 		injector::WriteMemory<DWORD>(imageBase + 0xA6ECF, (DWORD)cab1IP, true);
 		injector::WriteMemory<DWORD>(imageBase + 0xA7371, (DWORD)cab1IP, true);
+
+		// Android cannot grant a Wine process CAP_NET_ADMIN, and Wine's
+		// AddIPAddress implementation is an ERROR_NOT_SUPPORTED stub.  Wacky
+		// Races crashes while formatting that error before DirectPlay can bind
+		// its socket.  Keep the Windows and desktop-Wine paths untouched; the
+		// Android ALSA bridge variable is injected only by Winlator.  The output
+		// outputs must be zeroed so DeleteIPAddress(0) is harmless during
+		// shutdown. Keep a real WINAPI call target rather than NOPing the call:
+		// AddIPAddress is stdcall on x86 and is responsible for popping its five
+		// arguments from the caller's stack.
+		if (getenv("ANDROID_ALSA_SERVER") != nullptr)
+			injector::MakeCALL(
+				imageBase + 0xA45B5, AddIPAddressAndroidWrap, true);
 	}
 
 	if (GameDetect::currentGame == GameID::SF4) 
@@ -1311,6 +1864,25 @@ static InitFunction initFunction([]()
 	if (GameDetect::currentGame == GameID::KOFXIII) 
 	{
 		DWORD oldPageProtection = 0;
+
+		if (GetEnvironmentVariableA(
+				"TP_KOFXIII_QUARTZ_NULL_GUARD", nullptr, 0) != 0)
+		{
+			MH_Initialize();
+			MH_CreateHook(
+				reinterpret_cast<void*>(imageBase + 0xC10F0),
+				KofXiiiMovieQueryHook,
+				reinterpret_cast<void**>(&KofXiiiMovieQueryOriginal));
+			MH_CreateHook(
+				reinterpret_cast<void*>(imageBase + 0xC0FC0),
+				KofXiiiMovieUpdateHook,
+				reinterpret_cast<void**>(&KofXiiiMovieUpdateOriginal));
+			MH_CreateHook(
+				reinterpret_cast<void*>(imageBase + 0xC1110),
+				KofXiiiMoviePositionHook,
+				reinterpret_cast<void**>(&KofXiiiMoviePositionOriginal));
+			MH_EnableHook(MH_ALL_HOOKS);
+		}
 
 		if (ToBool(config["General"]["Windowed"])) 
 		{
@@ -1404,6 +1976,17 @@ static InitFunction initFunction([]()
 
 	if (GameDetect::currentGame == GameID::KOF98UM)
 	{
+		// IDirect3DQuery9::GetData returns a four-byte BOOL for an event
+		// query. The game requests one byte at the last byte of a stack
+		// local, directly before its return address. The native D3D9
+		// runtime tolerated that undersized request, but DXVK writes the
+		// complete BOOL and clears the return address. Use the full local
+		// and the API's correct result size for both polling calls.
+		injector::WriteMemory<BYTE>(imageBase + 0x211B, 0x04, true);
+		injector::WriteMemory<BYTE>(imageBase + 0x211F, 0x0C, true);
+		injector::WriteMemory<BYTE>(imageBase + 0x2140, 0x04, true);
+		injector::WriteMemory<BYTE>(imageBase + 0x2144, 0x0C, true);
+
 		//static const char* d = ".\\OpenParrot\\%s";
 		//static const char* s04d02d02d = ".\\OpenParrot\\%s%04d%02d%02d.txt";
 		//static const char* s04d02d02d_03d = ".\\OpenParrot\\%s%04d%02d%02d_%03d.txt";
@@ -1426,6 +2009,25 @@ static InitFunction initFunction([]()
 	if (GameDetect::currentGame == GameID::ElevatorActionDeathParade)
 	{
 		DWORD oldPageProtection = 0;
+
+		// PhysXLoader 2.8.1 gates its supported local-runtime path by
+		// comparing a six-byte registry value with the first network
+		// adapter's MAC address. Wine does not provide a stable match for
+		// that legacy probe, so NxCreatePhysicsSDK returns null even when
+		// the exact title-local PhysXCore runtime is present. Keep the
+		// loader and game binaries untouched and make only this in-memory
+		// predicate report that the local runtime is available.
+		if (getenv("ANDROID_ALSA_SERVER") != nullptr)
+		{
+			if (HMODULE physXLoader = GetModuleHandleA("PhysXLoader.dll"))
+			{
+				injector::WriteMemoryRaw(
+					reinterpret_cast<uintptr_t>(physXLoader) + 0x1660,
+					"\xB0\x01\xC3",
+					3,
+					true);
+			}
+		}
 
 		// change window title
 		static const char* title = "OpenParrot - Elevator Action: Death Parade";
@@ -1486,6 +2088,7 @@ static InitFunction initFunction([]()
 	if (GameDetect::currentGame == GameID::MusicGunGun2)
 	{
 		DWORD oldPageProtection = 0;
+		InstallMusicGunGun2AndroidD3D9Compatibility();
 		
 		if (ToBool(config["General"]["Windowed"]))
 		{

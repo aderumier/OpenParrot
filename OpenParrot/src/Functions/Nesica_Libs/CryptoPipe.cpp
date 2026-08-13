@@ -270,22 +270,119 @@ HANDLE PipeStuff_410550(int gameId)
 					HeapFree(hHeap2, 0, v6);
 					if (Buffer)
 					{
-						if (CryptExportKey(v16, hKey, 1u, 0, 0, &pdwDataLen))
+						// KOF XIII Climax expects the imported content key as a
+						// PLAINTEXTKEYBLOB encrypted directly with the client's RSA
+						// public key. The generic NESiCA protocol returns a SIMPLEBLOB
+						// instead; Windows accepts that response but Climax then feeds
+						// still-encrypted resource buffers to Lua.
+						if (gameId == static_cast<int>(NesicaKey::KOFXIIIClimax))
 						{
-							v8 = pdwDataLen;
-							hHeap3 = GetProcessHeap();
-							v10 = (BYTE *)HeapAlloc(hHeap3, 0, v8);
-							CryptExportKey(v16, hKey, 1u, 0, v10, &pdwDataLen);
-							WriteFile(hPipe, &pdwDataLen, 4u, &dwRead, 0);
-							WriteFile(hPipe, v10, pdwDataLen, &dwRead, 0);
-							hHeap4 = GetProcessHeap();
-							HeapFree(hHeap4, 0, v10);
+							DWORD plainBlobLength = 0;
+							if (CryptExportKey(v16, 0, PLAINTEXTKEYBLOB, 0, 0, &plainBlobLength))
+							{
+								BYTE* plainBlob = static_cast<BYTE*>(
+									HeapAlloc(GetProcessHeap(), 0, plainBlobLength));
+								if (plainBlob &&
+									CryptExportKey(
+										v16,
+										0,
+										PLAINTEXTKEYBLOB,
+										0,
+										plainBlob,
+										&plainBlobLength))
+								{
+									DWORD rsaKeyBits = 0;
+									DWORD rsaKeyBitsLength = sizeof(rsaKeyBits);
+									DWORD encryptedCapacity = 256;
+									if (CryptGetKeyParam(
+											hKey,
+											KP_KEYLEN,
+											reinterpret_cast<BYTE*>(&rsaKeyBits),
+											&rsaKeyBitsLength,
+											0) &&
+										rsaKeyBits != 0)
+									{
+										encryptedCapacity = (rsaKeyBits + 7) / 8;
+									}
+
+									if (encryptedCapacity < plainBlobLength)
+										encryptedCapacity = plainBlobLength;
+
+									BYTE* encryptedBlob = static_cast<BYTE*>(
+										HeapAlloc(GetProcessHeap(), 0, encryptedCapacity));
+									if (encryptedBlob)
+									{
+										memcpy(encryptedBlob, plainBlob, plainBlobLength);
+										pdwDataLen = plainBlobLength;
+										if (CryptEncrypt(
+												hKey,
+												0,
+												TRUE,
+												0,
+												encryptedBlob,
+												&pdwDataLen,
+												encryptedCapacity))
+										{
+											WriteFile(hPipe, &pdwDataLen, 4u, &dwRead, 0);
+											WriteFile(hPipe, encryptedBlob, pdwDataLen, &dwRead, 0);
+										}
+										else
+										{
+											Buffer = 0;
+											WriteFile(hPipe, &Buffer, 4u, &dwRead, 0);
+										}
+										HeapFree(GetProcessHeap(), 0, encryptedBlob);
+									}
+									else
+									{
+										Buffer = 0;
+										WriteFile(hPipe, &Buffer, 4u, &dwRead, 0);
+									}
+								}
+								else
+								{
+									Buffer = 0;
+									WriteFile(hPipe, &Buffer, 4u, &dwRead, 0);
+								}
+								if (plainBlob)
+									HeapFree(GetProcessHeap(), 0, plainBlob);
+							}
+							else
+							{
+								Buffer = 0;
+								WriteFile(hPipe, &Buffer, 4u, &dwRead, 0);
+							}
 						}
 						else
 						{
-							Buffer = 0;
-							//LogStuff("It failed in the export of the key. \n", v12);
-							WriteFile(hPipe, &Buffer, 4u, &dwRead, 0);
+							if (CryptExportKey(v16, hKey, SIMPLEBLOB, 0, 0, &pdwDataLen))
+							{
+								v8 = pdwDataLen;
+								hHeap3 = GetProcessHeap();
+								v10 = (BYTE *)HeapAlloc(hHeap3, 0, v8);
+								if (v10 &&
+									CryptExportKey(v16, hKey, SIMPLEBLOB, 0, v10, &pdwDataLen))
+								{
+									WriteFile(hPipe, &pdwDataLen, 4u, &dwRead, 0);
+									WriteFile(hPipe, v10, pdwDataLen, &dwRead, 0);
+								}
+								else
+								{
+									Buffer = 0;
+									WriteFile(hPipe, &Buffer, 4u, &dwRead, 0);
+								}
+								if (v10)
+								{
+									hHeap4 = GetProcessHeap();
+									HeapFree(hHeap4, 0, v10);
+								}
+							}
+							else
+							{
+								Buffer = 0;
+								//LogStuff("It failed in the export of the key. \n", v12);
+								WriteFile(hPipe, &Buffer, 4u, &dwRead, 0);
+							}
 						}
 						if (v16)
 							CryptDestroyKey(v16);
