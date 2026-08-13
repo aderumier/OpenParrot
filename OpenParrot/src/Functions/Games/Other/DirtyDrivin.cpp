@@ -14,7 +14,6 @@
 #include <fstream>
 #include "d3d9.h"
 #include "Utility/Helper.h"
-#include "Utility/WineCompat.h"
 #include "Mmsystem.h"
 #include <intrin.h>
 
@@ -708,7 +707,9 @@ static int TraceDirtyInitStep3Method(
 
 static bool IsDirtyDrivinRunningUnderWine()
 {
-	return IsWineCompatEnabled();
+	const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+	return ntdll != nullptr &&
+		GetProcAddress(ntdll, "wine_get_version") != nullptr;
 }
 
 static int __fastcall DirtyInitStep3Method58Hook(void* self, void*)

@@ -2,7 +2,6 @@
 #include "Utility/InitFunction.h"
 #include "Functions/Global.h"
 #include "Utility\Hooking.Patterns.h"
-#include "Utility/WineCompat.h"
 #include <Xinput.h>
 #include <winbase.h>
 #include <math.h>
@@ -368,23 +367,6 @@ static void __declspec(naked) JusticeLeagueLuaArrayGuard()
 	}
 }
 
-// Resolve a single pattern match, or nullptr when the module does not contain
-// it. These guards now install on desktop Wine too, so a build of the module
-// that does not match must skip the guard rather than dereference an empty
-// match list: hook::pattern only asserts on a miss, which is a no-op in a
-// Release build.
-template<size_t Len>
-static DWORD* FindJusticeLeagueGuardSite(
-	HMODULE module,
-	const char (&signature)[Len],
-	ptrdiff_t offset = 0)
-{
-	auto matches = hook::module_pattern(module, signature).count_hint(1);
-	if (matches.size() != 1)
-		return nullptr;
-	return matches.get_first<DWORD>(offset);
-}
-
 static DWORD WINAPI InstallJusticeLeagueAspectGuard(LPVOID)
 {
 	HMODULE renderer = nullptr;
@@ -416,82 +398,71 @@ static DWORD WINAPI InstallJusticeLeagueAspectGuard(LPVOID)
 		}
 	}
 
-	auto guardSite = FindJusticeLeagueGuardSite(
+	auto guardSite = hook::module_pattern(
 		renderer,
 		"8B 8E 7C 01 00 00 8B 11 8D 44 24 1C 50 8D 44 24 1C 50 "
-		"FF 92 90 00 00 00 DB 44 24 18 8B 4E 6C 8B 56 68 DA 74 24 1C",
-		24);
-	if (guardSite != nullptr)
-	{
-		justiceLeagueAspectGuardReturn =
-			reinterpret_cast<DWORD>(guardSite) + 7;
-		injector::MakeJMP(guardSite, JusticeLeagueAspectGuard, true);
-		injector::MakeNOP(reinterpret_cast<DWORD>(guardSite) + 5, 2);
-	}
+		"FF 92 90 00 00 00 DB 44 24 18 8B 4E 6C 8B 56 68 DA 74 24 1C")
+		.get_first<DWORD>(24);
+	justiceLeagueAspectGuardReturn =
+		reinterpret_cast<DWORD>(guardSite) + 7;
+	injector::MakeJMP(guardSite, JusticeLeagueAspectGuard, true);
+	injector::MakeNOP(reinterpret_cast<DWORD>(guardSite) + 5, 2);
 
-	auto projectionGuardSite = FindJusticeLeagueGuardSite(
+	auto projectionGuardSite = hook::module_pattern(
 		renderer,
-		"DB 44 24 14 DA 74 24 18 DE F9 D9 E8 D9 F3 DC C0");
-	if (projectionGuardSite != nullptr)
-	{
-		justiceLeagueProjectionGuardReturn =
-			reinterpret_cast<DWORD>(projectionGuardSite) + 8;
-		injector::MakeJMP(
-			projectionGuardSite,
-			JusticeLeagueProjectionGuard,
-			true);
-		injector::MakeNOP(
-			reinterpret_cast<DWORD>(projectionGuardSite) + 5,
-			3);
-	}
+		"DB 44 24 14 DA 74 24 18 DE F9 D9 E8 D9 F3 DC C0")
+		.get_first<DWORD>();
+	justiceLeagueProjectionGuardReturn =
+		reinterpret_cast<DWORD>(projectionGuardSite) + 8;
+	injector::MakeJMP(
+		projectionGuardSite,
+		JusticeLeagueProjectionGuard,
+		true);
+	injector::MakeNOP(
+		reinterpret_cast<DWORD>(projectionGuardSite) + 5,
+		3);
 
 	HMODULE lua = GetModuleHandleA("toluaxx.dll");
 	if (lua != nullptr)
 	{
-		auto luaCompactGuardSite = FindJusticeLeagueGuardSite(
+		auto luaCompactGuardSite = hook::module_pattern(
 			lua,
-			"DD 44 24 08 DB 5C 24 04 DB 44 24 04 DD 44 24 08 DA E9");
-		if (luaCompactGuardSite != nullptr)
-		{
-			justiceLeagueLuaCompactGuardReturn =
-				reinterpret_cast<DWORD>(luaCompactGuardSite) + 0x19;
-			justiceLeagueLuaCompactGuardInvalid =
-				reinterpret_cast<DWORD>(luaCompactGuardSite) + 0x2E;
-			injector::MakeJMP(
-				luaCompactGuardSite,
-				JusticeLeagueLuaCompactGuard,
-				true);
-		}
+			"DD 44 24 08 DB 5C 24 04 DB 44 24 04 DD 44 24 08 DA E9")
+			.get_first<DWORD>();
+		justiceLeagueLuaCompactGuardReturn =
+			reinterpret_cast<DWORD>(luaCompactGuardSite) + 0x19;
+		justiceLeagueLuaCompactGuardInvalid =
+			reinterpret_cast<DWORD>(luaCompactGuardSite) + 0x2E;
+		injector::MakeJMP(
+			luaCompactGuardSite,
+			JusticeLeagueLuaCompactGuard,
+			true);
 
-		auto luaIndexGuardSite = FindJusticeLeagueGuardSite(
+		auto luaIndexGuardSite = hook::module_pattern(
 			lua,
-			"DD 44 24 18 DB 5C 24 10 DB 44 24 10 DD 44 24 18 DA E9");
-		if (luaIndexGuardSite != nullptr)
-		{
-			justiceLeagueLuaIndexGuardReturn =
-				reinterpret_cast<DWORD>(luaIndexGuardSite) + 0x19;
-			justiceLeagueLuaIndexGuardInvalid =
-				reinterpret_cast<DWORD>(luaIndexGuardSite) + 0x45;
-			injector::MakeJMP(
-				luaIndexGuardSite,
-				JusticeLeagueLuaIndexGuard,
-				true);
-		}
+			"DD 44 24 18 DB 5C 24 10 DB 44 24 10 DD 44 24 18 DA E9")
+			.get_first<DWORD>();
+		justiceLeagueLuaIndexGuardReturn =
+			reinterpret_cast<DWORD>(luaIndexGuardSite) + 0x19;
+		justiceLeagueLuaIndexGuardInvalid =
+			reinterpret_cast<DWORD>(luaIndexGuardSite) + 0x45;
+		injector::MakeJMP(
+			luaIndexGuardSite,
+			JusticeLeagueLuaIndexGuard,
+			true);
 
-		auto luaIntegerGuardSite = FindJusticeLeagueGuardSite(
+		auto luaIntegerGuardSite = hook::module_pattern(
 			lua,
-			"DD 44 24 04 DB 5C 24 14 DB 44 24 14 DD 07 DA E9");
-		if (luaIntegerGuardSite != nullptr)
-		{
-			justiceLeagueLuaIntegerGuardReturn =
-				reinterpret_cast<DWORD>(luaIntegerGuardSite) + 0x17;
-			justiceLeagueLuaIntegerGuardInvalid =
-				reinterpret_cast<DWORD>(luaIntegerGuardSite) + 0x28;
-			injector::MakeJMP(
-				luaIntegerGuardSite,
-				JusticeLeagueLuaIntegerGuard,
-				true);
-		}
+			"DD 44 24 04 DB 5C 24 14 DB 44 24 14 DD 07 DA E9")
+			.get_first<DWORD>();
+		justiceLeagueLuaIntegerGuardReturn =
+			reinterpret_cast<DWORD>(luaIntegerGuardSite) + 0x17;
+		justiceLeagueLuaIntegerGuardInvalid =
+			reinterpret_cast<DWORD>(luaIntegerGuardSite) + 0x28;
+		injector::MakeJMP(
+			luaIntegerGuardSite,
+			JusticeLeagueLuaIntegerGuard,
+			true);
 
 		auto luaArrayGuardSite = hook::module_pattern(
 			lua,
@@ -606,10 +577,10 @@ DWORD WINAPI WindowRT8(LPVOID lpParam)
 			else ShowWindow(hWndRT8, SW_SHOWDEFAULT);
 		}
 		// This helper only polls mouse buttons for optional window movement.
-		// Yield between polls under Wine so it does not consume an entire CPU
-		// core and starve the engine's startup work.
+		// Yield between polls on Android so it does not consume an entire guest
+		// CPU core and starve the engine's startup work under Box64/Winlator.
 		// Preserve the established native Windows polling behavior.
-		if (IsWineCompatEnabled())
+		if (getenv("ANDROID_ALSA_SERVER") != nullptr)
 			Sleep(16);
 	}
 }
@@ -668,10 +639,7 @@ static InitFunction JLeagueFunc([]()
 {
 	GetDesktopResolution(horizontal8, vertical8);
 
-	// DX9Renderer.dlo divides by the render dimensions the moment it is loaded,
-	// and any Wine host can still report zero there while Winex11 is mapping
-	// the window. The guards below only clamp that transient case.
-	if (IsWineCompatEnabled())
+	if (getenv("ANDROID_ALSA_SERVER") != nullptr)
 	{
 		CreateThread(NULL, 0, InstallJusticeLeagueAspectGuard, NULL, 0, NULL);
 	}
@@ -686,9 +654,10 @@ static InitFunction JLeagueFunc([]()
 
 	// The optional mouse drag/minimize helper enters User32 from a secondary
 	// thread while Wine is still bringing up Winex11. It is not useful with the
-	// Android touch overlay and can race Winex11 initialization there, so drop
-	// it only on Android; native Windows and desktop Wine keep the helper.
-	if (ToBool(config["General"]["Windowed"]) && !IsAndroidWineRuntime())
+	// Android touch overlay and can race Winex11 initialization, so keep the
+	// established helper only on native Windows.
+	if (ToBool(config["General"]["Windowed"]) &&
+		getenv("ANDROID_ALSA_SERVER") == nullptr)
 	{
 		CreateThread(NULL, 0, WindowRT8, NULL, 0, NULL);
 	}

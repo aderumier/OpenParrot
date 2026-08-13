@@ -7,7 +7,6 @@
 #include "Functions/Nesica_Libs/NesysEmu.h"
 #include "Functions/Nesica_Libs/RegHooks.h"
 #include "Utility/Hooking.Patterns.h"
-#include "Utility/WineCompat.h"
 #include <Functions/Global.h>
 #include <d3d9.h>
 #include <iphlpapi.h>
@@ -662,7 +661,7 @@ namespace
 
 		if (gameWindow != nullptr)
 		{
-			// Wine's X11 driver can create Akai Katana's window without
+			// Wine's Android X11 path can create Akai Katana's window without
 			// queuing the initial paint that its blocking GetMessage loop
 			// expects. Wait until D3D9 has finished creating the device, then
 			// wake that loop exactly once. Repeated paints are unnecessary and
@@ -718,7 +717,8 @@ static InitFunction initFunction([]()
 		init_NesysEmu();
 #if _M_IX86
 	init_CryptoPipe(GameDetect::NesicaKey);
-	if (GameDetect::IsAkaiKatana() && IsWineCompatEnabled())
+	if (GameDetect::IsAkaiKatana() &&
+		getenv("ANDROID_ALSA_SERVER") != nullptr)
 	{
 		const uintptr_t imageBase =
 			reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));

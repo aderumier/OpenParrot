@@ -1,7 +1,6 @@
 #include <StdInc.h>
 #include "Utility/InitFunction.h"
 #include "Functions/Global.h"
-#include "Utility/WineCompat.h"
 #if _M_IX86
 DWORD mainModuleBase;
 
@@ -19,12 +18,14 @@ static bool IsGtiClubDiagnosticsEnabled()
 
 static bool ShouldTolerateGtiClubRawSocketBindFailure()
 {
-	// No Wine host grants the game the raw-socket privileges AVS wants, so the
-	// bind failure is expected on desktop Wine as well as under Winlator.
-	if (IsWineCompatEnabled())
+	char androidAlsaServer[2] = {};
+	if (GetEnvironmentVariableA(
+		"ANDROID_ALSA_SERVER",
+		androidAlsaServer,
+		_countof(androidAlsaServer)) > 0)
 		return true;
 
-	// Host-only validation switch. The production Wine path above does not
+	// Host-only validation switch. The production Android path above does not
 	// depend on this variable, but keeping the override allows the exact same
 	// in-memory instruction to be exercised on Windows without changing the
 	// executable or its CRC.

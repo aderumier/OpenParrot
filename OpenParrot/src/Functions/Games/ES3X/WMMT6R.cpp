@@ -1,7 +1,6 @@
 #include <StdInc.h>
 #include "Utility/InitFunction.h"
 #include "Functions/Global.h"
-#include "Utility/WineCompat.h"
 #include "MinHook.h"
 #include <Utility/Hooking.Patterns.h>
 #include <thread>
@@ -553,7 +552,8 @@ static DWORD WINAPI SpamMulticast(LPVOID)
 
 	setsockopt(sock, IPPROTO_IP, IP_MULTICAST_LOOP, (char*)& reuse, sizeof(reuse));
 
-	const bool useAndroidTransport = IsAndroidWineRuntime();
+	const bool useAndroidTransport =
+		getenv("ANDROID_ALSA_SERVER") != nullptr;
 	const bool useLoopbackTransport =
 		useAndroidTransport && ipaddr == "0.0.0.0";
 	if (useAndroidTransport)
